@@ -1,0 +1,204 @@
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+  AIRFLOW__CORE__FERNET_KEY: ""
+  MSSQL_ODBC_DSN: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sqlserver;DATABASE=${MSSQL_DATABASE:-ecommerce};UID=sa;PWD=${MSSQL_SA_PASSWORD};TrustServerCertificate=yes;"
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    # SQL Server's official image is heavy by nature (JVM-less but still a
+    # full relational engine); this is the one component in the stack we
+    # deliberately do NOT try to make "lighter", since demonstrating
+    # SQL-Server-specific performance technique is the point of the exercise.
+    mem_limit: 2g
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  topics-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command: >
+      "rpk topic create webhook-events      --partitions 6 --replicas 1 --brokers redpanda:9092 &&
+       rpk topic create order-approved      --partitions 3 --replicas 1 --brokers redpanda:9092 &&
+       rpk topic create order-approved-dlq  --partitions 1 --replicas 1 --brokers redpanda:9092"
+
+  migrate:
+    build:
+      context: ./db
+    environment:
+      MSSQL_HOST: sqlserver
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_DATABASE: ${MSSQL_DATABASE:-ecommerce}
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+  webhook-receiver:
+    build:
+      context: ./services/webhook_receiver
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+    ports:
+      - "8000:8000"
+    depends_on:
+      topics-init:
+        condition: service_completed_successfully
+
+  ingestion-consumer:
+    build:
+      context: .
+      dockerfile: services/ingestion_consumer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: mssql+pyodbc://sa:${MSSQL_SA_PASSWORD}@sqlserver/${MSSQL_DATABASE:-ecommerce}?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topics-init:
+        condition: service_completed_successfully
+    # Scale out with: docker compose up --scale ingestion-consumer=3
+    # Redpanda rebalances the webhook-events partitions across replicas
+    # automatically; a small per-process connection pool (common/db.py)
+    # keeps total DB connections bounded regardless of replica count.
+
+  order-approved-worker:
+    build:
+      context: ./services/order_approved_worker
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      EXTERNAL_API_URL: http://mock-external-api:9000/erp/orders
+    depends_on:
+      topics-init:
+        condition: service_completed_successfully
+
+  mock-external-api:
+    build:
+      context: ./services/mock_external_api
+    environment:
+      FAILURE_RATE: ${FAILURE_RATE:-0.3}
+    ports:
+      - "9000:9000"
+
+  airflow-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  airflow-init:
+    build:
+      context: ./airflow
+    environment:
+      <<: *airflow-env
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname admin --lastname admin --role Admin --email admin@example.com \
+          || true
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+  airflow-webserver:
+    build:
+      context: ./airflow
+    command: webserver
+    environment:
+      <<: *airflow-env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      sqlserver:
+        condition: service_healthy
+
+  airflow-scheduler:
+    build:
+      context: ./airflow
+    command: scheduler
+    environment:
+      <<: *airflow-env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      sqlserver:
+        condition: service_healthy
+
+  load-simulator:
+    build:
+      context: ./services/load_simulator
+    profiles: ["tools"]  # only runs on demand: docker compose --profile tools run --rm load-simulator
+    depends_on:
+      - webhook-receiver
+    entrypoint: ["python", "simulate.py", "--url", "http://webhook-receiver:8000/webhooks/events"]
+
+volumes:
+  sqlserver_data:
+  redpanda_data:
+  airflow_pg_data:
+  airflow_logs:
