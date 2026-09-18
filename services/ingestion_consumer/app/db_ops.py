@@ -201,17 +201,29 @@ def record_status_history(
 
 def update_order_status(conn: Connection, external_order_id: str, new_status: str) -> tuple[int, str] | None:
     """Returns (order_id, previous_status), or None if the order isn't known
-    yet (an out-of-order webhook arrived before ORDER_CREATED)."""
+    yet (an out-of-order webhook arrived before ORDER_CREATED).
+
+    SQL Server forbids `OUTPUT ... ` without an `INTO` clause on a table that
+    has an enabled AFTER trigger for the same statement type — and `orders`
+    has trg_orders_block_retro_update (AFTER UPDATE). Routing OUTPUT into a
+    table variable first sidesteps that restriction; it does not weaken the
+    trigger, which still fires and can still roll the whole batch back for a
+    terminal order.
+    """
     row = conn.execute(
         text(
             """
+            DECLARE @updated TABLE (order_id BIGINT, previous_status VARCHAR(20));
+
             UPDATE orders
             SET status = :new_status,
                 updated_at = SYSUTCDATETIME(),
                 closed_at = CASE WHEN :new_status IN ('DELIVERED','CANCELLED','CLOSED')
                                   THEN SYSUTCDATETIME() ELSE closed_at END
-            OUTPUT inserted.order_id, deleted.status AS previous_status
-            WHERE external_order_id = :external_order_id
+            OUTPUT inserted.order_id, deleted.status INTO @updated
+            WHERE external_order_id = :external_order_id;
+
+            SELECT order_id, previous_status FROM @updated;
             """
         ),
         {"new_status": new_status, "external_order_id": external_order_id},
