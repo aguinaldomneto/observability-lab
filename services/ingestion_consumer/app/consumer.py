@@ -17,6 +17,7 @@ Concurrency / backpressure story (see README for the full writeup):
     there is no risk of two processes racing to write the same order.
 """
 import asyncio
+import decimal
 import logging
 import os
 
@@ -29,6 +30,15 @@ from common.db import get_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ingestion-consumer")
+
+
+def _json_default(value):
+    """orjson has no native Decimal support (SQL Server NUMERIC columns come
+    back from pyodbc as decimal.Decimal); this is the fallback orjson calls
+    for anything it doesn't recognize."""
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    raise TypeError(f"Type is not JSON serializable: {type(value)}")
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 TOPIC_WEBHOOK_EVENTS = os.environ.get("TOPIC_WEBHOOK_EVENTS", "webhook-events")
@@ -120,12 +130,25 @@ async def handle_message(msg, producer: AIOKafkaProducer) -> None:
         return
 
     if outbox is not None and outbox["event_type"] == "ORDER_APPROVED":
-        await producer.send_and_wait(
-            TOPIC_ORDER_APPROVED,
-            key=str(outbox["order"]["order_id"]).encode(),
-            value=orjson.dumps(outbox["order"]),
-        )
-        log.info("Published ORDER_APPROVED for order_id=%s", outbox["order"]["order_id"])
+        try:
+            await producer.send_and_wait(
+                TOPIC_ORDER_APPROVED,
+                key=str(outbox["order"]["order_id"]).encode(),
+                value=orjson.dumps(outbox["order"], default=_json_default),
+            )
+            log.info("Published ORDER_APPROVED for order_id=%s", outbox["order"]["order_id"])
+        except Exception:
+            # The DB write already committed at this point — this order IS
+            # approved. Losing the outbound publish must never crash the
+            # consumer and take the rest of the batch down with it; it's the
+            # known gap in this prototype's simplified outbox pattern (see
+            # README) that a real deployment would close with a proper
+            # outbox table + relay instead of a best-effort publish here.
+            log.exception(
+                "Failed to publish ORDER_APPROVED for order_id=%s — order is committed in the "
+                "DB but the external-integration event was NOT published",
+                outbox["order"]["order_id"],
+            )
 
 
 async def main() -> None:
