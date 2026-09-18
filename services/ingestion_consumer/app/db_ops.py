@@ -213,6 +213,8 @@ def update_order_status(conn: Connection, external_order_id: str, new_status: st
     row = conn.execute(
         text(
             """
+            SET NOCOUNT ON;
+
             DECLARE @updated TABLE (order_id BIGINT, previous_status VARCHAR(20));
 
             UPDATE orders

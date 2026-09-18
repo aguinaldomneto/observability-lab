@@ -22,7 +22,7 @@ import os
 
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import SQLAlchemyError
 
 import db_ops
 from common.db import get_engine
@@ -110,8 +110,12 @@ async def handle_message(msg, producer: AIOKafkaProducer) -> None:
     except db_ops.DuplicateEvent:
         log.info("Duplicate event %s — already processed, skipping (idempotent no-op)", event_id)
         return
-    except DBAPIError as exc:
-        # Covers the trigger rejecting a retroactive update to a terminal order.
+    except SQLAlchemyError as exc:
+        # Covers real DB errors (e.g. the trigger rejecting a retroactive
+        # update to a terminal order) and driver/result-handling errors alike
+        # (SQLAlchemyError is the common base of DBAPIError and things like
+        # ResourceClosedError) — a single bad message must never take down
+        # the whole consumer process.
         log.error("DB error processing event %s: %s", event_id, exc)
         return
 
