@@ -66,9 +66,15 @@ services:
     # immediately (that was the topics-init crash-on-startup bug).
     command:
       - |
-        rpk topic create webhook-events     --partitions 6 --replicas 1 --brokers redpanda:9092 &&
-        rpk topic create order-approved     --partitions 3 --replicas 1 --brokers redpanda:9092 &&
-        rpk topic create order-approved-dlq --partitions 1 --replicas 1 --brokers redpanda:9092
+        set -e
+        # Idempotent on purpose: redpanda_data is a named volume, so topics
+        # from a previous `docker compose up` already exist on a restart.
+        # `rpk topic create` exits non-zero on TOPIC_ALREADY_EXISTS, which
+        # would otherwise fail this container (and everything depending on
+        # it) every time it runs after the first.
+        rpk topic create webhook-events     --partitions 6 --replicas 1 --brokers redpanda:9092 || true
+        rpk topic create order-approved     --partitions 3 --replicas 1 --brokers redpanda:9092 || true
+        rpk topic create order-approved-dlq --partitions 1 --replicas 1 --brokers redpanda:9092 || true
 
   migrate:
     build:
