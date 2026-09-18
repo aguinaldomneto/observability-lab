@@ -95,33 +95,38 @@ async def send(client: httpx.AsyncClient, url: str, payload: dict, results: list
 async def run(args: argparse.Namespace) -> None:
     sem = asyncio.Semaphore(args.concurrency)
     results: list[tuple[int, float]] = []
-    duplicates_sent = 0
 
     async def bounded_send(client, url, payload):
         async with sem:
             await send(client, url, payload, results)
 
+    async def run_order(client: httpx.AsyncClient, seq: int) -> bool:
+        # Each order's own events are sent strictly in causal order (created
+        # -> approved -> payment) — a real partner would never fire
+        # ORDER_STATUS_CHANGED before the order it refers to exists. Ordering
+        # is only guaranteed *within* one order's sequence; different orders
+        # still run fully concurrently against each other via the semaphore,
+        # so this doesn't reduce overall throughput.
+        created_event, external_order_id = make_order_created(seq)
+        await bounded_send(client, args.url, created_event)
+
+        approved_event = make_status_changed(external_order_id, "APPROVED")
+        await bounded_send(client, args.url, approved_event)
+
+        payment_event = make_payment_confirmed(seq, external_order_id)
+        await bounded_send(client, args.url, payment_event)
+
+        if random.random() < args.duplicate_rate:
+            await bounded_send(client, args.url, dict(created_event))
+            return True
+        return False
+
     async with httpx.AsyncClient() as client:
-        tasks = []
-        replay_pool: list[dict] = []
-        for seq in range(args.orders):
-            created_event, external_order_id = make_order_created(seq)
-            tasks.append(bounded_send(client, args.url, created_event))
-            replay_pool.append(created_event)
-
-            approved_event = make_status_changed(external_order_id, "APPROVED")
-            tasks.append(bounded_send(client, args.url, approved_event))
-
-            payment_event = make_payment_confirmed(seq, external_order_id)
-            tasks.append(bounded_send(client, args.url, payment_event))
-
-            if random.random() < args.duplicate_rate:
-                duplicates_sent += 1
-                tasks.append(bounded_send(client, args.url, dict(created_event)))
-
         start = time.perf_counter()
-        await asyncio.gather(*tasks)
+        outcomes = await asyncio.gather(*(run_order(client, seq) for seq in range(args.orders)))
         elapsed = time.perf_counter() - start
+
+    duplicates_sent = sum(outcomes)
 
     ok = sum(1 for status, _ in results if 200 <= status < 300)
     total = len(results)
