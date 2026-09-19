@@ -210,6 +210,14 @@ def generate_and_load(**context) -> None:
             "-b", str(batch_size),
             "-h", "TABLOCK",
             "-e", error_file,
+            # bcp's default network packet size (4096 bytes) is a known
+            # throughput bottleneck for bulk loads; 65535 is the documented
+            # max. The smoke test measured only ~1941 rows/sec with the
+            # default, suspiciously close to fast_executemany's v1 numbers
+            # for a minimally logged bulk copy — this is the first thing to
+            # rule out before concluding minimal logging itself isn't
+            # kicking in (see README "Parte 3" for how to check log growth).
+            "-a", "65535",
         ]
         bcp_start = time.perf_counter()
         result = subprocess.run(bcp_cmd, capture_output=True, text=True)
