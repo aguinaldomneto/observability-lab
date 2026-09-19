@@ -199,6 +199,13 @@ def generate_and_load(**context) -> None:
             "-d", os.environ["MSSQL_DATABASE"],
             "-U", "sa",
             "-P", os.environ["MSSQL_SA_PASSWORD"],
+            # ODBC Driver 18 defaults to encrypted + strictly-verified
+            # connections; the SQL Server container only has a self-signed
+            # cert (same reason the pyodbc DSN carries
+            # TrustServerCertificate=yes and sqlcmd is called with -C
+            # elsewhere in this repo). bcp's equivalent, added in bcp v18,
+            # is -u ("trust server certificate").
+            "-u",
             "-f", FORMAT_FILE,
             "-b", str(batch_size),
             "-h", "TABLOCK",
