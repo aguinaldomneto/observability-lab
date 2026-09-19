@@ -1,0 +1,11 @@
+12.0
+9
+1     SQLCHAR             0     64     ","      2     external_order_id       ""
+2     SQLCHAR             0     64     ","      3     client_external_id      ""
+3     SQLCHAR             0     16     ","      4     order_date              ""
+4     SQLCHAR             0     20     ","      5     status                  ""
+5     SQLCHAR             0     24     ","      6     total_amount            ""
+6     SQLCHAR             0     50     ","      7     region                  ""
+7     SQLCHAR             0     30     ","      8     channel                 ""
+8     SQLCHAR             0     12     ","      9     item_count              ""
+9     SQLCHAR             0     50     "\n"     10    load_batch_id           ""
