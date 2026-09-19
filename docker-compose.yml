@@ -6,6 +6,11 @@ x-airflow-env: &airflow-env
   AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
   AIRFLOW__CORE__FERNET_KEY: ""
   MSSQL_ODBC_DSN: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sqlserver;DATABASE=${MSSQL_DATABASE:-ecommerce};UID=sa;PWD=${MSSQL_SA_PASSWORD};TrustServerCertificate=yes;"
+  # used directly (not via the DSN above) by generate_and_load, which shells
+  # out to bcp instead of going through pyodbc for the bulk load itself
+  MSSQL_HOST: sqlserver
+  MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+  MSSQL_DATABASE: ${MSSQL_DATABASE:-ecommerce}
 
 services:
   sqlserver:

@@ -26,7 +26,7 @@ saída, tudo com foco em performance.
                                │ status = APPROVED           │
                                ▼                              │ Airflow (LocalExecutor)
                      ┌────────────────────┐                   │ DAG bulk_load_dimensions
-                     │ topic: order-approved                  │ 10M+ linhas, fast_executemany
+                     │ topic: order-approved                  │ 10M+ linhas, bcp+TABLOCK
                      └─────────┬───────────┘                   ▼
                                ▼                       order_history_fact
                      ┌────────────────────┐
@@ -75,8 +75,9 @@ containers de terceiros, usando apenas Python + PyPI, que são liberados):
 **O que você precisa rodar você mesmo** (em uma máquina com Docker e internet
 normal, ou CI): `docker compose up --build`, a suíte de idempotência
 (`load-simulator`), o trigger da DAG do Airflow com os 10M linhas reais
-contra o SQL Server, e a verificação do throughput de escrita (`fast_executemany`).
-As instruções abaixo cobrem exatamente isso.
+contra o SQL Server, e a verificação do throughput de escrita (`bcp` +
+`TABLOCK`, ver seção "Versionamento e rollback" sobre a reescrita de
+`fast_executemany` → `bcp`). As instruções abaixo cobrem exatamente isso.
 
 ## Como rodar
 
@@ -124,6 +125,48 @@ docker compose up -d --scale ingestion-consumer=3
 O Redpanda rebalanceia as partições do tópico `webhook-events` entre as
 réplicas automaticamente; cada partição pertence a um único consumer por vez,
 então não há risco de duas réplicas processarem o mesmo pedido em paralelo.
+
+## Versionamento e rollback
+
+A reescrita da Parte 3 (`fast_executemany` → `bcp`/`TABLOCK`) é a primeira
+mudança arquitetural depois que a carga de 10M linhas já tinha sido
+validada de ponta a ponta contra o servidor de teste real — ou seja, o
+ponto anterior era conhecido-bom e vale a pena poder voltar a ele sem
+depender de memória do que mudou. Duas tags anotadas marcam isso no Git:
+
+* **`v1-fast-executemany`**: estado antes desta reescrita. `pyodbc` +
+  `cursor.fast_executemany = True`, medido em **9817s (~2h43min)** para 10M
+  linhas no servidor Debian 13 de teste — mais lento (é DML logado linha a
+  linha), mas é a versão que já foi comprovadamente testada ponta a ponta,
+  incluindo idempotência/concorrência (2000 pedidos simulados) e a Parte 4.
+* **`v2-bcp-minimal-logging`**: este estado. Reescreve só a Parte 3
+  (`generate_and_load` em `airflow/dags/bulk_load_dimensions.py`, mais o
+  `airflow/Dockerfile` para instalar `mssql-tools18` e o `db/entrypoint.sh`
+  para setar `RECOVERY SIMPLE`) — as Partes 1, 2 e 4 não mudam nesta
+  reescrita. Ainda não validado de ponta a ponta contra um SQL Server real
+  (ver "Parte 3" e "Limitações conhecidas" abaixo).
+
+**Para voltar para v1** se a v2 quebrar algo:
+
+```bash
+git checkout v1-fast-executemany -- airflow/dags/bulk_load_dimensions.py \
+    airflow/Dockerfile db/entrypoint.sh airflow/scripts/order_history_fact.fmt
+# ou, para descartar totalmente os commits da v2 neste branch:
+git reset --hard v1-fast-executemany
+```
+
+Duas ressalvas sobre o que o rollback de código **não** desfaz sozinho:
+
+1. `db/entrypoint.sh` roda `ALTER DATABASE ... SET RECOVERY SIMPLE` de forma
+   idempotente (só altera se ainda não estiver em SIMPLE) — voltar o código
+   para v1 não reverte esse ajuste no banco já em execução, porque v1 nunca
+   gerenciava o recovery model. Se isso importar, rode manualmente
+   `ALTER DATABASE [ecommerce] SET RECOVERY FULL;` ou recrie o volume
+   `sqlserver_data` do zero.
+2. O schema (`db/models.py`, migrations Alembic) **não muda** nesta
+   reescrita — só o mecanismo de escrita da Parte 3. Então não há migration
+   para reverter; qualquer linha já carregada em `order_history_fact` por
+   uma versão continua legível pela outra.
 
 ## Parte 1 — Modelagem e migrations
 
@@ -229,16 +272,42 @@ fugir da ideia" que dá pra fazer aqui sem comprometer a arquitetura.
   fica retida. **Testado de ponta a ponta nesta sessão**: 10.000.000 de
   linhas geradas, 243.611 linhas/s, pico de RSS de 25.9 MiB — plano,
   independente do total.
-* **Escrita**: `pyodbc` com `cursor.fast_executemany = True` +
-  `executemany` em lotes — o driver ODBC usa bind de parâmetros em array
-  (bulk copy) em vez de um round-trip por linha, que é exatamente a técnica
-  que o enunciado pede e que insert linha a linha não tem como entregar.
-  Commit por lote (não por linha), o que limita o crescimento do log de
-  transação sem pagar o overhead de commit por linha.
+* **Escrita (v2 — `bcp` + `TABLOCK`, minimal logging)**: `generate_and_load`
+  escreve os lotes gerados em um arquivo intermediário e chama `bcp` (utility
+  client-side, `mssql-tools18`, instalado no `airflow/Dockerfile`) para
+  carregar `dbo.order_history_fact` com o hint `-h "TABLOCK"`, banco em
+  `RECOVERY SIMPLE` (`db/entrypoint.sh`) e **sem índices secundários** na
+  tabela nesse momento — as três condições para o SQL Server qualificar a
+  carga como *minimamente logada* (o log de transação registra só a extensão
+  alocada, não cada linha, ao contrário do `fast_executemany`, que é rápido
+  mas continua sendo DML totalmente logado linha a linha via TDS).
+  `airflow/scripts/order_history_fact.fmt` é um format file do `bcp` que
+  mapeia os 9 campos gerados para as colunas de destino e propositalmente
+  **não** inclui `order_history_id` (IDENTITY) nem `loaded_at` (`DEFAULT
+  SYSUTCDATETIME()`) — o `bcp` deixa essas duas para o servidor gerar
+  sozinho. (Cogitei simplificar isso fazendo `bcp` contra uma *view* com só
+  as 9 colunas carregáveis, em vez de um format file — descartei, porque
+  carga em massa através de view é sempre totalmente logada no SQL Server,
+  não importa o recovery model nem o `TABLOCK`; teria voltado à estaca
+  zero.)
   * A tabela `order_history_fact` **não tem índices secundários na criação**
     — eles são criados **depois** da carga (`create_post_load_indexes`),
     porque manter índices atualizados a cada um dos 10M inserts é o custo
-    evitável mais caro de uma carga em massa.
+    evitável mais caro de uma carga em massa, e porque índices secundários
+    presentes durante a carga também competem com o requisito de minimal
+    logging acima.
+  * **v1 desta task** usava `pyodbc` com `cursor.fast_executemany = True` +
+    `executemany` em lotes (ainda existe, com tag `v1-fast-executemany` no
+    Git, para rollback — ver "Versionamento e rollback" abaixo). Foi
+    **medido de ponta a ponta no servidor Debian 13 do usuário**: os 10M
+    linhas carregaram com sucesso, mas em **9817s (~2h43min)**
+    (`run_duration` do próprio Airflow), tempo considerado alto demais para
+    o critério de "performance máxima" do desafio — daí a reescrita para
+    `bcp`. **A v2 (`bcp`) ainda não foi remedida de ponta a ponta**: só foi
+    validada nesta sessão a geração/formatação do arquivo intermediário (sem
+    SQL Server disponível aqui, ver limitação de ambiente no topo do
+    README); o número real de throughput da v2 depende de rodar no mesmo
+    servidor de teste.
 * **Validação**: a task `validate_row_count` conta as linhas do lote pelo
   `load_batch_id` e falha a DAG se vier abaixo do esperado.
 * Parametrizável via `dag_run.conf`: `{"total_rows": ..., "batch_size": ...}`
@@ -274,6 +343,14 @@ para provar.
   (`db_ops` retorna `None`); o comentário no código deixa explícito que uma
   versão real trataria isso com uma dead-letter topic + retry com delay, não
   descarte silencioso.
-* Não medi throughput de escrita real do `fast_executemany` contra um SQL
-  Server de verdade (só a geração dos dados) — depende de rodar
-  `docker compose` numa máquina com Docker Hub acessível.
+* A reescrita da Parte 3 para `bcp`/`TABLOCK`/minimal logging (v2) não foi
+  medida de ponta a ponta contra um SQL Server de verdade nesta sessão — só
+  a geração/formatação do arquivo intermediário. O que muda de fato o
+  throughput real (contenção de I/O, `TABLOCK` sob concorrência, o próprio
+  `bcp` encontrando o driver `mssql-tools18` no `PATH` da imagem) só se prova
+  rodando `docker compose` numa máquina com acesso normal a registries —
+  exatamente como a v1 (`fast_executemany`) foi validada antes.
+* A máquina de teste roda todos os serviços juntos (SQL Server, Redpanda,
+  Postgres do Airflow, scheduler, webserver, 4 serviços Python) — contenção
+  de recursos pode mascarar o ganho real da técnica `bcp` em si. Isso é
+  ambiental, não motivo para não medir.
