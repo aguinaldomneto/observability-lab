@@ -132,27 +132,41 @@ A reescrita da Parte 3 (`fast_executemany` → `bcp`/`TABLOCK`) é a primeira
 mudança arquitetural depois que a carga de 10M linhas já tinha sido
 validada de ponta a ponta contra o servidor de teste real — ou seja, o
 ponto anterior era conhecido-bom e vale a pena poder voltar a ele sem
-depender de memória do que mudou. Duas tags anotadas marcam isso no Git:
+depender de memória do que mudou.
 
-* **`v1-fast-executemany`**: estado antes desta reescrita. `pyodbc` +
+* **`e5c59ee`**: estado antes desta reescrita ("v1"). `pyodbc` +
   `cursor.fast_executemany = True`, medido em **9817s (~2h43min)** para 10M
   linhas no servidor Debian 13 de teste — mais lento (é DML logado linha a
   linha), mas é a versão que já foi comprovadamente testada ponta a ponta,
   incluindo idempotência/concorrência (2000 pedidos simulados) e a Parte 4.
-* **`v2-bcp-minimal-logging`**: este estado. Reescreve só a Parte 3
+* **`0925e38`**: este estado ("v2"). Reescreve só a Parte 3
   (`generate_and_load` em `airflow/dags/bulk_load_dimensions.py`, mais o
   `airflow/Dockerfile` para instalar `mssql-tools18` e o `db/entrypoint.sh`
   para setar `RECOVERY SIMPLE`) — as Partes 1, 2 e 4 não mudam nesta
   reescrita. Ainda não validado de ponta a ponta contra um SQL Server real
   (ver "Parte 3" e "Limitações conhecidas" abaixo).
 
+Criei localmente as tags anotadas `v1-fast-executemany` (`e5c59ee`) e
+`v2-bcp-minimal-logging` (`0925e38`) nesta sessão, mas **o `git push` das
+tags foi rejeitado com 403** — a credencial desta sessão está autorizada só
+para o branch designado, não para `refs/tags/*` — então elas não existem no
+seu clone. Se quiser as tags de verdade (mais legível que decorar um SHA),
+rode localmente depois de um `git fetch`:
+
+```bash
+git tag -a v1-fast-executemany -m "pré-bcp, fast_executemany, 9817s/10M" e5c59ee
+git tag -a v2-bcp-minimal-logging -m "bcp + TABLOCK, minimal logging" 0925e38
+git push origin v1-fast-executemany v2-bcp-minimal-logging
+```
+
 **Para voltar para v1** se a v2 quebrar algo:
 
 ```bash
-git checkout v1-fast-executemany -- airflow/dags/bulk_load_dimensions.py \
-    airflow/Dockerfile db/entrypoint.sh airflow/scripts/order_history_fact.fmt
+git checkout e5c59ee -- airflow/dags/bulk_load_dimensions.py \
+    airflow/Dockerfile db/entrypoint.sh
+git rm airflow/scripts/order_history_fact.fmt   # não existia em v1
 # ou, para descartar totalmente os commits da v2 neste branch:
-git reset --hard v1-fast-executemany
+git reset --hard e5c59ee
 ```
 
 Duas ressalvas sobre o que o rollback de código **não** desfaz sozinho:

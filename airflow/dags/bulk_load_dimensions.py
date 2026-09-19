@@ -15,7 +15,8 @@ qualifies for *minimally logged* bulk import on SQL Server. Row-by-row
 challenge disqualifies, so this DAG never uses either.
 
 v1 of this task used `pyodbc` with `cursor.fast_executemany = True`
-(still tagged `v1-fast-executemany` in git for rollback). That is genuinely
+(commit e5c59ee — see README "Versionamento e rollback" for how to get
+back to it). That is genuinely
 faster than row-by-row `executemany`, because it switches parameter binding
 to the ODBC driver's array-binding protocol — but it is still a *logged*
 DML path: every inserted row is still fully written to the transaction log,
