@@ -135,27 +135,31 @@ ponto anterior era conhecido-bom e vale a pena poder voltar a ele sem
 depender de memória do que mudou.
 
 * **`e5c59ee`**: estado antes desta reescrita ("v1"). `pyodbc` +
-  `cursor.fast_executemany = True`, medido em **9817s (~2h43min)** para 10M
-  linhas no servidor Debian 13 de teste — mais lento (é DML logado linha a
-  linha), mas é a versão que já foi comprovadamente testada ponta a ponta,
-  incluindo idempotência/concorrência (2000 pedidos simulados) e a Parte 4.
-* **`0925e38`**: este estado ("v2"). Reescreve só a Parte 3
-  (`generate_and_load` em `airflow/dags/bulk_load_dimensions.py`, mais o
-  `airflow/Dockerfile` para instalar `mssql-tools18` e o `db/entrypoint.sh`
-  para setar `RECOVERY SIMPLE`) — as Partes 1, 2 e 4 não mudam nesta
-  reescrita. Ainda não validado de ponta a ponta contra um SQL Server real
-  (ver "Parte 3" e "Limitações conhecidas" abaixo).
+  `cursor.fast_executemany = True`, medido em **9815,1s (~2h43min, 1019
+  linhas/s)** para 10M linhas no servidor Debian 13 de teste — mais lento (é
+  DML logado linha a linha), mas é a versão que já foi comprovadamente
+  testada ponta a ponta, incluindo idempotência/concorrência (2000 pedidos
+  simulados) e a Parte 4.
+* **`0925e38`**: primeira versão da reescrita ("v2 inicial") — tinha dois
+  bugs que só apareceram testando contra o SQL Server real: `bcp` sem
+  `TrustServerCertificate` (SSL falhava) e depois packet size incompatível
+  com TLS. Não é o commit pra usar como ponto de restauração da v2.
+* **`48c3d48`** (`HEAD` deste branch): v2 com os dois bugs acima corrigidos
+  (commits `9fa6fc3` e `48c3d48`) — **medida de ponta a ponta contra o SQL
+  Server real: 3293,2s (~55min, 3038 linhas/s), ~3x mais rápido que a v1**,
+  com log de transação comprovadamente sem crescer durante a carga (ver
+  "Parte 3" acima). Este é o commit de referência da v2.
 
 Criei localmente as tags anotadas `v1-fast-executemany` (`e5c59ee`) e
-`v2-bcp-minimal-logging` (`0925e38`) nesta sessão, mas **o `git push` das
+`v2-bcp-minimal-logging` (`48c3d48`) nesta sessão, mas **o `git push` das
 tags foi rejeitado com 403** — a credencial desta sessão está autorizada só
 para o branch designado, não para `refs/tags/*` — então elas não existem no
 seu clone. Se quiser as tags de verdade (mais legível que decorar um SHA),
 rode localmente depois de um `git fetch`:
 
 ```bash
-git tag -a v1-fast-executemany -m "pré-bcp, fast_executemany, 9817s/10M" e5c59ee
-git tag -a v2-bcp-minimal-logging -m "bcp + TABLOCK, minimal logging" 0925e38
+git tag -a v1-fast-executemany -m "pré-bcp, fast_executemany, 9815.1s/10M" e5c59ee
+git tag -a v2-bcp-minimal-logging -m "bcp + TABLOCK, minimal logging, 3293.2s/10M" 48c3d48
 git push origin v1-fast-executemany v2-bcp-minimal-logging
 ```
 
@@ -311,17 +315,26 @@ fugir da ideia" que dá pra fazer aqui sem comprometer a arquitetura.
     presentes durante a carga também competem com o requisito de minimal
     logging acima.
   * **v1 desta task** usava `pyodbc` com `cursor.fast_executemany = True` +
-    `executemany` em lotes (ainda existe, com tag `v1-fast-executemany` no
-    Git, para rollback — ver "Versionamento e rollback" abaixo). Foi
-    **medido de ponta a ponta no servidor Debian 13 do usuário**: os 10M
-    linhas carregaram com sucesso, mas em **9817s (~2h43min)**
-    (`run_duration` do próprio Airflow), tempo considerado alto demais para
-    o critério de "performance máxima" do desafio — daí a reescrita para
-    `bcp`. **A v2 (`bcp`) ainda não foi remedida de ponta a ponta**: só foi
-    validada nesta sessão a geração/formatação do arquivo intermediário (sem
-    SQL Server disponível aqui, ver limitação de ambiente no topo do
-    README); o número real de throughput da v2 depende de rodar no mesmo
-    servidor de teste.
+    `executemany` em lotes (commit `e5c59ee`, ver "Versionamento e rollback"
+    abaixo para voltar a ela). **Medida de ponta a ponta no servidor Debian
+    13 do usuário**: os 10M linhas carregaram com sucesso em **9815,1s
+    (~2h43min, 1019 linhas/s)**, tempo considerado alto demais para o
+    critério de "performance máxima" do desafio — daí a reescrita para
+    `bcp`.
+  * **v2 (`bcp`) medida de ponta a ponta no mesmo servidor**: **3293,2s
+    (~55min, 3038 linhas/s) — cerca de 3x mais rápido que a v1**, sendo
+    521,8s para gerar o arquivo intermediário (~19.164 linhas/s) e 2770,0s
+    no `bcp` propriamente dito (3610 linhas/s, média que o próprio `bcp`
+    reporta). A prova de que é minimal logging de verdade, não só "ficou
+    mais rápido por algum motivo": `total_log_size_in_bytes` em
+    `sys.dm_db_log_space_usage` ficou **exatamente igual** (612.360.192
+    bytes) antes e depois da carga dos 10M — o log de transação nunca
+    precisou crescer. Uma carga totalmente logada de 10M linhas dessa
+    largura não caberia num log de ~584MB sem pelo menos um auto-growth.
+    Os dois números (v1 e v2) são de uma única execução cada, na mesma
+    máquina de teste que roda todos os outros serviços do stack junto (ver
+    "Limitações conhecidas" mais abaixo) — uma máquina dedicada
+    provavelmente mostraria uma diferença ainda maior.
 * **Validação**: a task `validate_row_count` conta as linhas do lote pelo
   `load_batch_id` e falha a DAG se vier abaixo do esperado.
 * Parametrizável via `dag_run.conf`: `{"total_rows": ..., "batch_size": ...}`
@@ -357,13 +370,15 @@ para provar.
   (`db_ops` retorna `None`); o comentário no código deixa explícito que uma
   versão real trataria isso com uma dead-letter topic + retry com delay, não
   descarte silencioso.
-* A reescrita da Parte 3 para `bcp`/`TABLOCK`/minimal logging (v2) não foi
-  medida de ponta a ponta contra um SQL Server de verdade nesta sessão — só
-  a geração/formatação do arquivo intermediário. O que muda de fato o
-  throughput real (contenção de I/O, `TABLOCK` sob concorrência, o próprio
-  `bcp` encontrando o driver `mssql-tools18` no `PATH` da imagem) só se prova
-  rodando `docker compose` numa máquina com acesso normal a registries —
-  exatamente como a v1 (`fast_executemany`) foi validada antes.
+* A reescrita da Parte 3 para `bcp`/`TABLOCK`/minimal logging (v2) **já foi
+  medida de ponta a ponta** contra o SQL Server real do servidor de teste:
+  3293,2s para os 10M linhas (~3x mais rápido que os 9815,1s da v1), com o
+  log de transação sem crescer nem um byte durante a carga — ver "Parte 3"
+  acima para os números completos. O caminho não foi limpo até chegar lá:
+  o `bcp` primeiro falhou por TLS (certificado autoassinado, resolvido com
+  `-u`), depois por packet size incompatível com TLS (resolvido caindo de
+  65535 para 16384 bytes) — ambos os bugs e as correções estão no histórico
+  de commits do branch.
 * A máquina de teste roda todos os serviços juntos (SQL Server, Redpanda,
   Postgres do Airflow, scheduler, webserver, 4 serviços Python) — contenção
   de recursos pode mascarar o ganho real da técnica `bcp` em si. Isso é

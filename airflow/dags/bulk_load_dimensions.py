@@ -16,17 +16,31 @@ challenge disqualifies, so this DAG never uses either.
 
 v1 of this task used `pyodbc` with `cursor.fast_executemany = True`
 (commit e5c59ee — see README "Versionamento e rollback" for how to get
-back to it). That is genuinely
-faster than row-by-row `executemany`, because it switches parameter binding
-to the ODBC driver's array-binding protocol — but it is still a *logged*
-DML path: every inserted row is still fully written to the transaction log,
-row by row, over the TDS protocol. It measured ~9817s (~2h43m) for 10M rows
-on the reference test server, which is why this was rewritten. `bcp` writes
+back to it). That is genuinely faster than row-by-row `executemany`,
+because it switches parameter binding to the ODBC driver's array-binding
+protocol — but it is still a *logged* DML path: every inserted row is
+still fully written to the transaction log, row by row, over the TDS
+protocol. It measured 9815.1s (~2h43m, 1019 rows/sec) for 10M rows on the
+reference test server, which is why this was rewritten. `bcp` writes
 through the bulk-copy interface instead, which — combined with `TABLOCK`
 and SIMPLE recovery, and no other indexes/triggers on the table at load
-time — lets SQL Server skip most of that per-row log write. This has not
-yet been re-measured end to end (see README "Parte 3"); the mechanism is
-correct, the exact new number is still open until re-run on real hardware.
+time — lets SQL Server skip most of that per-row log write.
+
+Measured end to end on the same reference server: **3293.2s (~55min,
+3038 rows/sec) for the same 10M rows — ~3x faster than v1**, split as
+521.8s to generate the data file (~19,164 rows/sec) and 2770.0s for `bcp`
+itself (3610 rows/sec, `bcp`'s own reported average). The strongest
+evidence this is genuinely minimally logged, not just "faster somehow":
+`sys.dm_db_log_space_usage` showed `total_log_size_in_bytes` completely
+flat (612,360,192 bytes) before and after the 10M-row load — the
+transaction log never needed to auto-grow. A fully logged write of 10M
+rows at this row width would not fit in a ~584MB log without at least one
+growth event; the load-simulator and smoke-test runs against this same DB
+already confirm growth events show up in this DMV when they happen.
+Both numbers are single runs on a test box that also runs SQL Server,
+Redpanda, the Airflow metadata Postgres, and 4 Python services
+concurrently (see "Limitações conhecidas" in the README) — a dedicated
+box would likely show a larger gap.
 
 Two mechanical details worth calling out because they're easy to get wrong
 with `bcp` and silently fall back to full logging:
