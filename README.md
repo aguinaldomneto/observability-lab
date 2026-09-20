@@ -113,9 +113,10 @@ O `load-simulator` dispara uma leva de pedidos simulados, incluindo uma fração
 
 ```bash
 docker compose --profile tools run --rm load-simulator \
-    python simulate.py --url http://webhook-receiver:8000/webhooks/events \
     --orders 2000 --concurrency 200 --duplicate-rate 0.15
 ```
+
+O `entrypoint` do serviço já roda `python simulate.py --url http://webhook-receiver:8000/webhooks/events` sozinho — só precisa passar os argumentos extras (`--orders`, `--concurrency`, `--duplicate-rate`), não repetir `python simulate.py --url ...` de novo, senão eles ficam colados depois do entrypoint e o argparse rejeita como argumento desconhecido.
 
 Depois confira no SQL Server:
 
