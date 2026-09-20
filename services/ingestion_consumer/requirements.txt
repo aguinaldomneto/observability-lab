@@ -1,0 +1,6 @@
+aiokafka==0.11.0
+sqlalchemy==2.0.35
+pyodbc==5.1.0
+orjson==3.10.7
+python-dotenv==1.0.1
+cramjam==2.12.1
