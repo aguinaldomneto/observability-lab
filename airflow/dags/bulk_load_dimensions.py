@@ -1,69 +1,13 @@
-"""Part 3: bulk load of >=10M synthetic rows into `order_history_fact`.
+"""Bulk load of >=10M synthetic rows into `order_history_fact` via `bcp`.
 
-Memory requirement: rows are produced and written in fixed-size chunks
-(`BATCH_SIZE`, default 50k) via a generator (see
-airflow/scripts/data_generator.py) — at no point does the process hold more
-than one batch in memory, regardless of how large `total_rows` is. This was
-benchmarked standalone for the full 10M rows (see README) before being
-wired into Airflow.
-
-Speed requirement (v2): writes use the `bcp` client utility (part of
-`mssql-tools18`, installed in `airflow/Dockerfile`) against `TABLOCK`, with
-the database in SIMPLE recovery (`db/entrypoint.sh`) — this is what actually
-qualifies for *minimally logged* bulk import on SQL Server. Row-by-row
-`INSERT` (or SQLAlchemy ORM `session.add` per row) is explicitly what the
-challenge disqualifies, so this DAG never uses either.
-
-v1 of this task used `pyodbc` with `cursor.fast_executemany = True`
-(commit e5c59ee — see README "Versionamento e rollback" for how to get
-back to it). That is genuinely faster than row-by-row `executemany`,
-because it switches parameter binding to the ODBC driver's array-binding
-protocol — but it is still a *logged* DML path: every inserted row is
-still fully written to the transaction log, row by row, over the TDS
-protocol. It measured 9815.1s (~2h43m, 1019 rows/sec) for 10M rows on the
-reference test server, which is why this was rewritten. `bcp` writes
-through the bulk-copy interface instead, which — combined with `TABLOCK`
-and SIMPLE recovery, and no other indexes/triggers on the table at load
-time — lets SQL Server skip most of that per-row log write.
-
-Measured end to end on the same reference server: **3293.2s (~55min,
-3038 rows/sec) for the same 10M rows — ~3x faster than v1**, split as
-521.8s to generate the data file (~19,164 rows/sec) and 2770.0s for `bcp`
-itself (3610 rows/sec, `bcp`'s own reported average). The strongest
-evidence this is genuinely minimally logged, not just "faster somehow":
-`sys.dm_db_log_space_usage` showed `total_log_size_in_bytes` completely
-flat (612,360,192 bytes) before and after the 10M-row load — the
-transaction log never needed to auto-grow. A fully logged write of 10M
-rows at this row width would not fit in a ~584MB log without at least one
-growth event; the load-simulator and smoke-test runs against this same DB
-already confirm growth events show up in this DMV when they happen.
-Both numbers are single runs on a test box that also runs SQL Server,
-Redpanda, the Airflow metadata Postgres, and 4 Python services
-concurrently (see "Limitações conhecidas" in the README) — a dedicated
-box would likely show a larger gap.
-
-Two mechanical details worth calling out because they're easy to get wrong
-with `bcp` and silently fall back to full logging:
-1. `order_history_id` (IDENTITY) and `loaded_at` (server-side DEFAULT) are
-   not in the generated data file. `bcp` will not accept a data file with a
-   different column count than the target unless told how to map fields, so
-   `order_history_fact.fmt` (a non-XML bcp format file, checked into
-   `airflow/scripts/`) maps the 9 generated fields to their destination
-   column ordinals and simply omits columns 1 and 11 — `bcp` leaves those to
-   the identity generator and the column default, respectively.
-2. It would be simpler to `bcp` into a *view* that only exposes the 9
-   loadable columns, sidestepping the format file entirely. That was
-   considered and rejected: bulk importing through a view is documented as
-   always fully logged on SQL Server, regardless of recovery model or
-   `TABLOCK` — it would silently defeat the entire point of this rewrite.
-
-Executor note: this repo's docker-compose runs Airflow with LocalExecutor
-(Postgres metadata DB, no Celery/Redis) — for a single-DAG take-home
-prototype that is a lighter, equally valid choice: it still runs tasks as
-separate processes (not just threads), it does not require a message broker
-purely to schedule Airflow's own internal task queue, and the real
-concurrency-sensitive broker (Redpanda) already exists for the actual data
-pipeline.
+Rows are generated and written in fixed-size chunks (see
+airflow/scripts/data_generator.py), so memory use stays flat regardless of
+`total_rows`. The actual load goes through the `bcp` client utility against
+`TABLOCK`, with the database in SIMPLE recovery (`db/entrypoint.sh`) and no
+secondary indexes at load time — the three conditions SQL Server needs to
+treat a bulk import as *minimally logged* (see README, "Carga de 10M
+linhas", for the full comparison against a plain `pyodbc`/`fast_executemany`
+approach and the measured numbers).
 """
 from __future__ import annotations
 
@@ -213,24 +157,17 @@ def generate_and_load(**context) -> None:
             "-d", os.environ["MSSQL_DATABASE"],
             "-U", "sa",
             "-P", os.environ["MSSQL_SA_PASSWORD"],
-            # ODBC Driver 18 defaults to encrypted + strictly-verified
-            # connections; the SQL Server container only has a self-signed
-            # cert (same reason the pyodbc DSN carries
-            # TrustServerCertificate=yes and sqlcmd is called with -C
-            # elsewhere in this repo). bcp's equivalent, added in bcp v18,
-            # is -u ("trust server certificate").
+            # -u: trust the container's self-signed cert (same reason the
+            # pyodbc DSN elsewhere carries TrustServerCertificate=yes).
             "-u",
             "-f", FORMAT_FILE,
             "-b", str(batch_size),
             "-h", "TABLOCK",
             "-e", error_file,
-            # bcp's default network packet size (4096 bytes) is a known
-            # throughput bottleneck for bulk loads. 65535 is the documented
-            # max for bcp in general, but -u above means this connection is
-            # TLS-encrypted, and TLS record fragments cap at 16384 bytes —
-            # a larger packet size fails with "Packet size too large for
-            # SSL Encrypt/Decrypt operations" (confirmed against a real
-            # bcp run). 16384 is the correct ceiling here, not 65535.
+            # 65535 is bcp's documented max packet size, but -u means this
+            # connection is TLS-encrypted and TLS fragments cap at 16384 —
+            # anything higher fails with "Packet size too large for SSL
+            # Encrypt/Decrypt operations".
             "-a", "16384",
         ]
         bcp_start = time.perf_counter()

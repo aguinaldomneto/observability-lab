@@ -1,11 +1,6 @@
-"""Part 4: event-driven integration with the external system.
-
-Consumes the `order-approved` topic (produced by the ingestion consumer the
-instant an order's status flips to APPROVED — no polling of SQL Server
-involved) and POSTs the full order payload to the fictitious ERP. Resilience
-to *temporary* failures is handled by tenacity's exponential backoff; after
-the retry budget is exhausted, the message is forwarded to a dead-letter
-topic instead of being silently dropped or blocking the partition forever.
+"""Consumes `order-approved` (published the instant an order flips to
+APPROVED, no polling) and POSTs it to the external ERP. Exhausted retries go
+to a dead-letter topic instead of being dropped or blocking the partition.
 """
 import asyncio
 import logging

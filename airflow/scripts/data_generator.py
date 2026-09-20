@@ -1,17 +1,9 @@
 """Streaming synthetic-data generator for the 10M-row bulk load.
 
-Deliberately DB-agnostic and dependency-free (no Faker) so it can be unit
-tested and benchmarked in isolation from pyodbc/SQL Server — see
-airflow/scripts/test_data_generator.py.
-
-Faker was considered and rejected for this specific task: at the volumes
-this DAG targets (10M+ rows), Faker's provider overhead (~10k-50k rows/sec
-on typical hardware, since each field call re-does locale/regex work) turns
+No Faker on purpose: at 10M+ rows, Faker's per-field provider overhead turns
 data generation itself into the bottleneck. Sampling from small fixed pools
-with `random.choices` is what real bulk-load benchmarks (e.g. TPC-style data
-generators) do instead, and is 1-2 orders of magnitude faster, which keeps
-the wall-clock time dominated by the actual database write — the thing this
-exercise is supposed to measure.
+is 1-2 orders of magnitude faster and keeps wall-clock time dominated by the
+actual database write, which is what this exercise measures.
 """
 from __future__ import annotations
 

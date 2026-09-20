@@ -1,15 +1,5 @@
-"""Thin, stateless webhook edge.
-
-This service has exactly one job: accept the partner webhook over HTTP,
-validate its shape, and hand it to Kafka/Redpanda as fast as possible. It
-never touches SQL Server. That is the whole performance argument for
-choosing Kafka over a FastAPI-does-everything design (see README): under a
-burst of thousands of req/s, this process can never be the thing that blocks
-on a database lock or connection-pool exhaustion, because it has no
-database connection to exhaust. Backpressure is inherited for free from the
-Kafka producer's send buffer — if Redpanda (or the network to it) is slow,
-`producer.send_and_wait` simply takes longer to return, which naturally
-throttles the caller instead of piling up unbounded work in this process.
+"""Thin, stateless webhook edge: validates the payload and hands it to Kafka.
+Never touches SQL Server — see README for why that split matters under load.
 """
 import os
 import time

@@ -29,10 +29,6 @@ services:
       timeout: 5s
       retries: 15
       start_period: 30s
-    # SQL Server's official image is heavy by nature (JVM-less but still a
-    # full relational engine); this is the one component in the stack we
-    # deliberately do NOT try to make "lighter", since demonstrating
-    # SQL-Server-specific performance technique is the point of the exercise.
     mem_limit: 2g
 
   redpanda:
@@ -65,18 +61,11 @@ services:
       redpanda:
         condition: service_healthy
     entrypoint: ["sh", "-c"]
-    # NOTE: this must be a YAML list with a single string item, not a bare
-    # `command: >` block — folding it under `entrypoint: [... "-c"]` wraps
-    # the string in literal quote characters that `sh -c` chokes on
-    # immediately (that was the topics-init crash-on-startup bug).
     command:
       - |
         set -e
-        # Idempotent on purpose: redpanda_data is a named volume, so topics
-        # from a previous `docker compose up` already exist on a restart.
-        # `rpk topic create` exits non-zero on TOPIC_ALREADY_EXISTS, which
-        # would otherwise fail this container (and everything depending on
-        # it) every time it runs after the first.
+        # `|| true`: topics already exist on a restart (named volume), and
+        # `rpk topic create` exits non-zero for TOPIC_ALREADY_EXISTS.
         rpk topic create webhook-events     --partitions 6 --replicas 1 --brokers redpanda:9092 || true
         rpk topic create order-approved     --partitions 3 --replicas 1 --brokers redpanda:9092 || true
         rpk topic create order-approved-dlq --partitions 1 --replicas 1 --brokers redpanda:9092 || true
@@ -115,10 +104,7 @@ services:
         condition: service_completed_successfully
       topics-init:
         condition: service_completed_successfully
-    # Scale out with: docker compose up --scale ingestion-consumer=3
-    # Redpanda rebalances the webhook-events partitions across replicas
-    # automatically; a small per-process connection pool (common/db.py)
-    # keeps total DB connections bounded regardless of replica count.
+    # Scale out with: docker compose up -d --scale ingestion-consumer=3
 
   order-approved-worker:
     build:

@@ -1,20 +1,8 @@
 """Idempotent Kafka -> SQL Server consumer.
 
-Concurrency / backpressure story (see README for the full writeup):
-  * A small, bounded SQLAlchemy connection pool (see common/db.py) caps how
-    many concurrent connections this process can ever open against SQL
-    Server, no matter how fast Kafka can hand us messages.
-  * Messages are consumed in small batches (`getmany`, `max_batch_size`) and
-    each event is processed inside its own short transaction — no
-    long-running transactions holding locks while we wait on I/O.
-  * Kafka offsets are committed manually, only *after* the DB transaction for
-    that message has committed. If this process crashes mid-batch, the
-    un-committed messages are simply re-delivered on restart — which is safe
-    because processing is idempotent (see claim_event in db_ops.py).
-  * Scaling out is just running more instances of this container in the same
-    consumer group: Kafka rebalances partitions across them automatically,
-    and each partition is only ever owned by one consumer at a time, so
-    there is no risk of two processes racing to write the same order.
+Offsets are committed manually, only after the DB transaction for that
+message has committed — a crash mid-batch just replays already-idempotent
+messages. See README for the full concurrency/scaling story.
 """
 import asyncio
 import decimal
@@ -121,11 +109,8 @@ async def handle_message(msg, producer: AIOKafkaProducer) -> None:
         log.info("Duplicate event %s — already processed, skipping (idempotent no-op)", event_id)
         return
     except SQLAlchemyError as exc:
-        # Covers real DB errors (e.g. the trigger rejecting a retroactive
-        # update to a terminal order) and driver/result-handling errors alike
-        # (SQLAlchemyError is the common base of DBAPIError and things like
-        # ResourceClosedError) — a single bad message must never take down
-        # the whole consumer process.
+        # A single bad message (e.g. rejected by the retroactive-update
+        # trigger) must never take down the whole consumer process.
         log.error("DB error processing event %s: %s", event_id, exc)
         return
 
@@ -138,12 +123,9 @@ async def handle_message(msg, producer: AIOKafkaProducer) -> None:
             )
             log.info("Published ORDER_APPROVED for order_id=%s", outbox["order"]["order_id"])
         except Exception:
-            # The DB write already committed at this point — this order IS
-            # approved. Losing the outbound publish must never crash the
-            # consumer and take the rest of the batch down with it; it's the
-            # known gap in this prototype's simplified outbox pattern (see
-            # README) that a real deployment would close with a proper
-            # outbox table + relay instead of a best-effort publish here.
+            # The DB write already committed — the order IS approved. A
+            # failed publish must not crash the consumer (see README,
+            # "transactional outbox" under limitations, for the known gap).
             log.exception(
                 "Failed to publish ORDER_APPROVED for order_id=%s — order is committed in the "
                 "DB but the external-integration event was NOT published",

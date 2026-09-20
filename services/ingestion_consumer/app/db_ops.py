@@ -203,11 +203,9 @@ def update_order_status(conn: Connection, external_order_id: str, new_status: st
     """Returns (order_id, previous_status), or None if the order isn't known
     yet (an out-of-order webhook arrived before ORDER_CREATED).
 
-    SQL Server forbids `OUTPUT ... ` without an `INTO` clause on a table that
-    has an enabled AFTER trigger for the same statement type — and `orders`
-    has trg_orders_block_retro_update (AFTER UPDATE). Routing OUTPUT into a
-    table variable first sidesteps that restriction; it does not weaken the
-    trigger, which still fires and can still roll the whole batch back for a
+    OUTPUT is routed into a table variable because SQL Server forbids a bare
+    `OUTPUT ...` on a table with an enabled AFTER trigger — `orders` has
+    trg_orders_block_retro_update, which still fires and can still reject a
     terminal order.
     """
     row = conn.execute(

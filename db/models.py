@@ -1,20 +1,7 @@
 """SQLAlchemy models — source of truth for the schema (Alembic migrations mirror these).
 
-Design notes (see README for the full rationale):
-  * Surrogate keys are BIGINT IDENTITY, not GUID/UNIQUEIDENTIFIER. SQL Server's
-    clustered index is the table's physical row order; random GUID inserts
-    fragment it under high write concurrency, which is exactly the failure
-    mode this challenge is testing for. Every external system's natural key
-    (external_order_id, external_payment_id, ...) is kept as a separate
-    UNIQUE column and doubles as the idempotency key.
-  * `address` is SCD Type 2: a client's address history is preserved, and an
-    order stores a foreign key to the *specific version* of the address that
-    was valid when the order was placed, so a later address edit never
-    changes a historical order's snapshot.
-  * `orders` is protected against retroactive mutation once it reaches a
-    terminal status via an AFTER UPDATE trigger (see migration 0001), not by
-    application code alone — a business rule this important should not
-    depend on every future service remembering to enforce it.
+See README for the design rationale (surrogate keys, SCD2 addresses, the
+trigger that blocks retroactive order updates).
 """
 from __future__ import annotations
 
@@ -59,7 +46,7 @@ class Client(Base):
 
 
 class Address(Base):
-    """SCD Type 2: one row per version. `is_current=1` marks the active row."""
+    """SCD Type 2 — one row per version, `is_current=1` marks the active one."""
 
     __tablename__ = "address"
 
@@ -116,8 +103,7 @@ class Order(Base):
 
 
 class OrderItem(Base):
-    """Line items — not in the mandatory table list, but required to give the
-    Part 4 payload ("itens do pedido") something real to carry."""
+    """Line items of an order."""
 
     __tablename__ = "order_items"
 

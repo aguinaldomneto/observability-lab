@@ -18,13 +18,10 @@ echo "[db] ensuring database '${MSSQL_DATABASE}' exists"
 /opt/mssql-tools18/bin/sqlcmd -C -S "${MSSQL_HOST}" -U sa -P "${MSSQL_SA_PASSWORD}" -Q \
     "IF DB_ID('${MSSQL_DATABASE}') IS NULL CREATE DATABASE [${MSSQL_DATABASE}];"
 
-# Read Committed Snapshot Isolation: readers get a versioned snapshot instead
-# of blocking behind writers' locks (and vice versa). This is the single
-# highest-leverage SQL Server setting for "the pipeline must not lock the
-# destination DB under concurrent writers" — it doesn't replace the small
-# connection pools and short transactions in the app code, but without it
-# even well-written short transactions still cause reader/writer blocking
-# under enough concurrency.
+# Read Committed Snapshot Isolation: readers get a versioned snapshot
+# instead of blocking behind writers' locks, and vice versa — this is what
+# actually keeps the DB from locking up under concurrent writers, on top of
+# the app's small connection pools and short transactions.
 echo "[db] enabling READ_COMMITTED_SNAPSHOT on '${MSSQL_DATABASE}'"
 /opt/mssql-tools18/bin/sqlcmd -C -S "${MSSQL_HOST}" -U sa -P "${MSSQL_SA_PASSWORD}" -Q \
     "IF (SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = '${MSSQL_DATABASE}') = 0
@@ -32,15 +29,10 @@ echo "[db] enabling READ_COMMITTED_SNAPSHOT on '${MSSQL_DATABASE}'"
         ALTER DATABASE [${MSSQL_DATABASE}] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
      END"
 
-# SIMPLE recovery model is a prerequisite for minimal logging on the Parte 3
-# bulk load (bcp + TABLOCK into order_history_fact, see
-# airflow/dags/bulk_load_dimensions.py) — without it, every bulk-copied row
-# is still fully written to the transaction log, which is most of the cost
-# fast_executemany's row-by-row logged DML was already paying. This is a
-# durable database setting (not toggled per-load), so it also means this
-# database is not a candidate for point-in-time restore, which is an
-# acceptable trade for a throwaway prototype but would not be for production
-# without a real backup strategy — full/bulk-logged backups still work.
+# SIMPLE recovery is a prerequisite for the minimally logged bulk load in
+# airflow/dags/bulk_load_dimensions.py (bcp + TABLOCK). Trade-off: this
+# database gives up point-in-time restore, fine for this prototype but not
+# for production without a real backup strategy on top.
 echo "[db] setting recovery model to SIMPLE on '${MSSQL_DATABASE}' for minimally logged bulk loads"
 /opt/mssql-tools18/bin/sqlcmd -C -S "${MSSQL_HOST}" -U sa -P "${MSSQL_SA_PASSWORD}" -Q \
     "IF (SELECT recovery_model FROM sys.databases WHERE name = '${MSSQL_DATABASE}') <> 3
