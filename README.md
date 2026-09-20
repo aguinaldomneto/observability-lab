@@ -216,6 +216,8 @@ O que o dashboard mostra:
 
 As métricas de negócio vêm direto dos 4 serviços Python (`prometheus_client`, endpoint `/metrics` em cada um — `webhook-receiver` e `mock-external-api` expõem no próprio host/porta HTTP; `ingestion-consumer` e `order-approved-worker` sobem um servidor de métricas à parte, nas portas `9100`/`9101`, só acessível dentro da rede do compose).
 
+**Sobre o `cAdvisor` e cgroup v2**: em host com cgroup v2 (padrão em distros recentes, Debian 13 incluso), o Docker isola cada container no próprio namespace de cgroup por padrão — sem ajuste, o `cAdvisor` só enxerga o cgroup dele mesmo (`id="/"` no Prometheus) e nunca descobre os containers vizinhos, então os painéis de CPU/memória ficam vazios mesmo com o scrape funcionando. O `docker-compose.yml` já vem com `cgroup: host` no serviço `cadvisor` pra resolver isso — se algum dia você tirar essa linha achando que é redundante, os painéis de infraestrutura voltam a ficar em branco.
+
 Duas ressalvas honestas:
 
 - **Painéis de SQL Server/Redpanda são só de disponibilidade (`up`), não de performance.** Os nomes exatos das métricas que o `mssql-exporter` e o Redpanda expõem variam por versão, e eu não tenho como validar isso contra uma instância rodando de verdade aqui — em vez de arriscar um painel com uma métrica que não existe (e que renderiza vazio sem avisar por quê), deixei só a confirmação de que o Prometheus está conseguindo coletar de cada um. Dá pra abrir `http://localhost:9090/targets` pra confirmar os scrapes, olhar o `/metrics` de cada exporter e completar os painéis com os nomes reais.
