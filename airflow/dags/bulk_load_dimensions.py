@@ -12,9 +12,9 @@ approach and the measured numbers).
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
 import sys
-import uuid
 
 from airflow.operators.python import PythonOperator
 
@@ -122,10 +122,30 @@ def generate_and_load(**context) -> None:
     conf = context["dag_run"].conf or {}
     total_rows = int(conf.get("total_rows", DEFAULT_TOTAL_ROWS))
     batch_size = int(conf.get("batch_size", DEFAULT_BATCH_SIZE))
-    load_batch_id = f"{context['ds']}-{uuid.uuid4().hex[:8]}"
+    # Derived from run_id (stable across retries of the same DAG run), not a
+    # fresh uuid per call — a retry after a partial bcp failure must reuse
+    # the same batch id so the cleanup below can find and remove the rows
+    # the failed attempt already inserted, instead of leaving them orphaned
+    # under an id nothing ever queries again.
+    run_id_digest = hashlib.sha1(context["dag_run"].run_id.encode()).hexdigest()[:8]
+    load_batch_id = f"{context['ds']}-{run_id_digest}"
 
     data_file = f"/tmp/order_history_fact_{load_batch_id}.csv"
     error_file = f"/tmp/order_history_fact_{load_batch_id}.bcp.err"
+
+    conn = _get_pyodbc_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM order_history_fact WHERE load_batch_id = ?", load_batch_id)
+        if cur.rowcount > 0:
+            log.info(
+                "removed %s row(s) left over from a previous failed attempt of batch %s",
+                cur.rowcount,
+                load_batch_id,
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
     start = time.perf_counter()
     written = 0

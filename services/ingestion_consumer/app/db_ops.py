@@ -8,10 +8,11 @@ together as a single unit.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
 TERMINAL_STATUSES = {"DELIVERED", "CANCELLED", "CLOSED"}
@@ -323,3 +324,23 @@ def resolve_order_id(conn: Connection, external_order_id: str) -> int | None:
         {"eid": external_order_id},
     ).first()
     return int(row.order_id) if row else None
+
+
+def log_pipeline_event(
+    engine: Engine, service: str, level: str, message: str, event_id: str | None = None
+) -> None:
+    """Persists an operational log row on its own connection, independent of
+    whatever transaction just failed. Best-effort: if the DB itself is the
+    thing that's down, this silently falls back to the caller's own
+    log.error/log.exception instead of masking the original failure."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO pipeline_log (service, level, message, event_id, created_at) "
+                    "VALUES (:service, :level, :message, :event_id, SYSUTCDATETIME())"
+                ),
+                {"service": service, "level": level, "message": message[:500], "event_id": event_id},
+            )
+    except Exception:
+        logging.getLogger(service).exception("Failed to write to pipeline_log")

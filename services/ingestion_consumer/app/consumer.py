@@ -100,11 +100,14 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
     try:
         event = orjson.loads(msg.value)
         event_id = event["event_id"]
-    except Exception:
+    except Exception as exc:
         # Malformed JSON or a missing event_id — not something a retry
         # would ever fix. Log and move on instead of crashing every
         # partition this consumer owns over one poison message.
         log.exception("Malformed message at offset %s — skipping", msg.offset)
+        db_ops.log_pipeline_event(
+            engine, "ingestion-consumer", "ERROR", f"malformed message at offset {msg.offset}: {exc}"
+        )
         return
 
     # OperationalError covers deadlocks, lock-wait timeouts (see
@@ -132,6 +135,9 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         return
     except OperationalError as exc:
         log.error("DB still unavailable/blocked after retries for event %s: %s", event_id, exc)
+        db_ops.log_pipeline_event(
+            engine, "ingestion-consumer", "ERROR", f"DB unavailable after retries: {exc}", event_id
+        )
         return
     except SQLAlchemyError as exc:
         # Not retried: data errors (e.g. truncation) or a rejected write
@@ -139,12 +145,16 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         # every time. A single bad message must never take down the
         # whole consumer process.
         log.error("DB error processing event %s: %s", event_id, exc)
+        db_ops.log_pipeline_event(engine, "ingestion-consumer", "ERROR", f"DB error: {exc}", event_id)
         return
-    except Exception:
+    except Exception as exc:
         # Same principle for anything process_event itself can raise on a
         # malformed but valid-JSON payload (e.g. a missing "data" field) —
         # a bad message must never take the whole consumer down.
         log.exception("Unexpected error processing event %s — skipping", event_id)
+        db_ops.log_pipeline_event(
+            engine, "ingestion-consumer", "ERROR", f"unexpected error: {exc}", event_id
+        )
         return
 
     if outbox is not None and outbox["event_type"] == "ORDER_APPROVED":
@@ -155,14 +165,22 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
                 value=orjson.dumps(outbox["order"], default=_json_default),
             )
             log.info("Published ORDER_APPROVED for order_id=%s", outbox["order"]["order_id"])
-        except Exception:
+        except Exception as exc:
             # The DB write already committed — the order IS approved. A
             # failed publish must not crash the consumer (see README,
             # "transactional outbox" under limitations, for the known gap).
+            order_id = outbox["order"]["order_id"]
             log.exception(
                 "Failed to publish ORDER_APPROVED for order_id=%s — order is committed in the "
                 "DB but the external-integration event was NOT published",
-                outbox["order"]["order_id"],
+                order_id,
+            )
+            db_ops.log_pipeline_event(
+                engine,
+                "ingestion-consumer",
+                "ERROR",
+                f"ORDER_APPROVED publish failed for order_id={order_id}: {exc}",
+                event_id,
             )
 
 
