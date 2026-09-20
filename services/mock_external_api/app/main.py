@@ -8,12 +8,15 @@ import os
 import random
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
 app = FastAPI(title="mock-external-erp")
 FAILURE_RATE = float(os.environ.get("FAILURE_RATE", "0.3"))
 
 received: list[dict[str, Any]] = []
+
+erp_orders_total = Counter("erp_orders_total", "Orders received by the mock ERP", ["outcome"])
 
 
 @app.get("/health")
@@ -21,12 +24,19 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/erp/orders")
 async def receive_order(request: Request) -> dict[str, Any]:
     if random.random() < FAILURE_RATE:
+        erp_orders_total.labels(outcome="simulated_failure").inc()
         raise HTTPException(status_code=503, detail="simulated transient failure")
     payload: dict[str, Any] = await request.json()
     received.append(payload)
+    erp_orders_total.labels(outcome="received").inc()
     return {"status": "received", "external_order_id": payload.get("external_order_id")}
 
 

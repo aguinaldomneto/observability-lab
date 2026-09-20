@@ -47,8 +47,9 @@ O webhook chega numa API HTTP fina (`webhook-receiver`) que só valida e publica
 ├── db/                      # schema (SQLAlchemy), migrations (Alembic) e o container que as aplica
 │   ├── models.py
 │   └── migrations/versions/
-├── airflow/                 # DAG da carga de 10M linhas + o gerador de dados sintéticos e seus testes
+├── airflow/                 # DAGs (carga de 10M linhas + limpeza do log) e o gerador de dados sintéticos
 │   ├── dags/bulk_load_dimensions.py
+│   ├── dags/pipeline_log_retention.py
 │   └── scripts/
 ├── services/
 │   ├── webhook_receiver/    # borda HTTP: recebe o webhook, publica no Kafka, não fala com o banco
@@ -56,6 +57,11 @@ O webhook chega numa API HTTP fina (`webhook-receiver`) que só valida e publica
 │   ├── order_approved_worker/  # consome pedidos aprovados e notifica o ERP externo
 │   ├── mock_external_api/   # ERP fictício, com falha configurável pra testar o retry
 │   └── load_simulator/      # dispara uma carga de webhooks pra testar idempotência/concorrência
+├── monitoring/
+│   ├── prometheus.yml                # o que o Prometheus coleta e de onde
+│   └── grafana/
+│       ├── provisioning/             # datasource do Prometheus + o provider do dashboard
+│       └── dashboards/pipeline.json  # o dashboard em si, carregado automaticamente
 ├── docker-compose.yml
 ├── pyproject.toml           # config do ruff (lint) e mypy (checagem de tipos)
 └── .env.example
@@ -68,8 +74,8 @@ Cada serviço tem seu próprio `Dockerfile` e `requirements.txt` — só o `inge
 Você precisa de:
 
 - Docker e Docker Compose v2 (`docker compose`, não `docker-compose`)
-- Pelo menos ~6-8 GB de RAM livres — o SQL Server sozinho já reserva 2 GB, e o resto da stack (Redpanda, Postgres do Airflow, scheduler, webserver, mais 4 serviços Python) roda tudo junto
-- Portas livres: `1433` (SQL Server), `8000` (webhook-receiver), `8080` (Airflow), `9000` (ERP fictício), `9092`/`9644` (Redpanda)
+- Pelo menos ~8-10 GB de RAM livres — o SQL Server sozinho já reserva 2 GB, e o resto da stack (Redpanda, Postgres do Airflow, scheduler, webserver, 4 serviços Python, Prometheus, Grafana, cAdvisor, o exporter do SQL Server) roda tudo junto
+- Portas livres: `1433` (SQL Server), `8000` (webhook-receiver), `8080` (Airflow), `9000` (ERP fictício), `9092`/`9644` (Redpanda), `9090` (Prometheus), `3000` (Grafana)
 
 ## Subindo o ambiente
 
@@ -183,7 +189,37 @@ O trade-off é real: mais uma peça de infraestrutura, e uma janela pequena "at-
 - **Erro transitório de banco tem retentativa; erro de dado, não.** `ingestion-consumer` distingue as duas coisas: um deadlock ou lock timeout (`OperationalError`) é retentado até 3 vezes com backoff antes de desistir — a chance real de a mesma transação passar na segunda tentativa é boa, porque geralmente é só concorrência momentânea. Já um dado truncado (campo maior que a coluna) ou uma escrita rejeitada pelo gatilho de pedido imutável são erros permanentes — retentar não muda o resultado, então são só logados e a mensagem é descartada, sem gastar tempo tentando de novo à toa.
 - **Uma mensagem ruim não derruba o consumer inteiro.** JSON malformado ou um payload sem um campo esperado é capturado, logado com o offset da mensagem, e pulado — o resto do tópico continua sendo processado normalmente. Sem isso, uma mensagem mal formada tiraria a ingestão de todas as partições até alguém reiniciar o serviço na mão.
 - **A carga de 10M linhas não fica pendurada pra sempre.** O `bcp` roda com um timeout (`BCP_TIMEOUT_SECONDS`, padrão 2h — bem acima dos ~55min medidos) — se a rede cair no meio da transferência, a task falha em vez de travar o worker do Airflow indefinidamente, e a retentativa já configurada na DAG (`retries: 1`) assume dali. A DAG também tem `max_active_runs=1`: não dá pra disparar duas cargas de 10M ao mesmo tempo brigando pelo mesmo `TABLOCK`.
+- **Um retry da carga de 10M não duplica nem deixa lixo pra trás.** O `load_batch_id` de cada execução é derivado do `run_id` da DAG (estável entre tentativas), não de um valor aleatório novo a cada chamada. Antes de gerar e carregar os dados, a task apaga qualquer linha que já exista com esse `load_batch_id` — um no-op na primeira tentativa, e uma limpeza de verdade se a tentativa anterior tiver falhado no meio do `bcp` (rede caiu com metade dos 10M já carregados, por exemplo). Sem isso, um retry geraria um `load_batch_id` novo e nunca saberia que a tentativa anterior deixou linhas órfãs pra trás — o total da tabela ia inflando silenciosamente a cada falha.
 - **A entrega pro ERP externo também não trava o worker.** Esgotadas as 5 tentativas do `tenacity` (ou um erro não-transiente do ERP), a mensagem vai pra `order-approved-dlq` em vez de derrubar o `order-approved-worker`.
+- **Erros de processamento ficam registrados num log consultável, não só no stdout do container.** A tabela `pipeline_log` recebe uma linha toda vez que o `ingestion-consumer` desiste de uma mensagem (dado malformado, erro de banco não recuperável, falha ao publicar `ORDER_APPROVED`). Ver a seção "Log operacional" abaixo pra política de retenção.
+- **Você fica sabendo quando a carga de 10M linhas termina, sem ficar olhando o Airflow.** A DAG `bulk_load_dimensions` manda uma mensagem no Telegram ao final — de sucesso ou de falha. Sem `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` configurados no `.env`, isso só é pulado (com um aviso no log), nunca quebra a DAG por causa disso.
+
+## Log operacional
+
+A tabela `pipeline_log` (`service`, `level`, `message`, `event_id`, `created_at`) guarda os erros que o `ingestion-consumer` não conseguiu resolver sozinho — mensagem malformada, erro de banco depois de esgotar as retentativas, falha ao publicar `ORDER_APPROVED`. É gravada numa conexão própria, separada da transação que falhou, e o próprio write é protegido: se o banco estiver genuinamente fora do ar, gravar o log também falharia, então isso cai de volta pro log do container em vez de mascarar o erro original.
+
+Ela é propositalmente limitada — não é uma tabela de negócio, é diagnóstico, então não faz sentido deixá-la crescer sem controle. A DAG `pipeline_log_retention` (`airflow/dags/pipeline_log_retention.py`) roda de hora em hora e aplica duas regras:
+
+1. Apaga tudo com mais de 7 dias.
+2. Se ainda assim passar de 100.000 linhas, apaga as 200 mais antigas.
+
+A rodada de cada hora é suficiente pra manter isso sob controle mesmo numa rajada de erros — 200 linhas por execução é uma margem confortável acima do que uma rajada real deveria gerar entre uma execução e outra.
+
+## Monitoramento
+
+Prometheus e Grafana sobem junto com o resto (fazem parte do `docker compose up -d --build`). Grafana fica em `http://localhost:3000` (login `admin`/`admin`, a menos que você tenha mudado `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD` no `.env`) e já vem com a fonte de dados do Prometheus e um dashboard (`Pipeline de e-commerce`) provisionados — não precisa configurar nada na mão.
+
+O que o dashboard mostra:
+
+- **Infraestrutura**: CPU e memória por container (via `cAdvisor`), e se o exporter do SQL Server e o Redpanda estão respondendo ao scrape do Prometheus.
+- **Pipeline de negócio**: taxa de webhooks recebidos por tipo de evento, taxa de eventos processados por resultado (sucesso, duplicata, erro de banco, mensagem malformada, falha de publicação — os mesmos rótulos que vão pro `pipeline_log`), taxa de entregas ao ERP externo por resultado, e taxa de pedidos recebidos pelo ERP fictício.
+
+As métricas de negócio vêm direto dos 4 serviços Python (`prometheus_client`, endpoint `/metrics` em cada um — `webhook-receiver` e `mock-external-api` expõem no próprio host/porta HTTP; `ingestion-consumer` e `order-approved-worker` sobem um servidor de métricas à parte, nas portas `9100`/`9101`, só acessível dentro da rede do compose).
+
+Duas ressalvas honestas:
+
+- **Painéis de SQL Server/Redpanda são só de disponibilidade (`up`), não de performance.** Os nomes exatos das métricas que o `mssql-exporter` e o Redpanda expõem variam por versão, e eu não tenho como validar isso contra uma instância rodando de verdade aqui — em vez de arriscar um painel com uma métrica que não existe (e que renderiza vazio sem avisar por quê), deixei só a confirmação de que o Prometheus está conseguindo coletar de cada um. Dá pra abrir `http://localhost:9090/targets` pra confirmar os scrapes, olhar o `/metrics` de cada exporter e completar os painéis com os nomes reais.
+- **Escalar o `ingestion-consumer` (`--scale ingestion-consumer=3`) faz o Prometheus enxergar só uma das réplicas.** O scrape aqui é estático (`ingestion-consumer:9100`), e a resolução de DNS do Compose não garante rodízio confiável entre múltiplas réplicas do mesmo serviço — pra métricas por réplica de verdade, precisaria de service discovery (Docker Swarm, ou um `file_sd` com IPs atualizados dinamicamente), fora do escopo deste projeto.
 
 ## Modelagem: o que cada tabela resolve
 

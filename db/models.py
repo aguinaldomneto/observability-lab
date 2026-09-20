@@ -187,3 +187,20 @@ class ProcessedWebhookEvent(Base):
     processed_at = Column(DateTime, nullable=True)
 
     __table_args__ = (UniqueConstraint("event_id", name="uq_processed_event_id"),)
+
+
+class PipelineLog(Base):
+    """Operational log (errors, exhausted retries, dropped messages) — kept
+    bounded by airflow/dags/pipeline_log_retention.py, not meant to grow
+    without limit like the business tables above."""
+
+    __tablename__ = "pipeline_log"
+
+    log_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    service = Column(String(50), nullable=False)
+    level = Column(String(10), nullable=False)
+    message = Column(String(500), nullable=False)
+    event_id = Column(String(100), nullable=True)
+
+    __table_args__ = (Index("ix_pipeline_log_created_at", "created_at"),)

@@ -12,9 +12,9 @@ approach and the measured numbers).
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
 import sys
-import uuid
 
 from airflow.operators.python import PythonOperator
 
@@ -22,6 +22,7 @@ from airflow import DAG
 
 sys.path.insert(0, "/opt/airflow/scripts")
 from data_generator import generate_rows  # noqa: E402
+from notify import send_telegram_message  # noqa: E402
 
 DEFAULT_TOTAL_ROWS = 10_000_000
 DEFAULT_BATCH_SIZE = 50_000
@@ -122,10 +123,30 @@ def generate_and_load(**context) -> None:
     conf = context["dag_run"].conf or {}
     total_rows = int(conf.get("total_rows", DEFAULT_TOTAL_ROWS))
     batch_size = int(conf.get("batch_size", DEFAULT_BATCH_SIZE))
-    load_batch_id = f"{context['ds']}-{uuid.uuid4().hex[:8]}"
+    # Derived from run_id (stable across retries of the same DAG run), not a
+    # fresh uuid per call — a retry after a partial bcp failure must reuse
+    # the same batch id so the cleanup below can find and remove the rows
+    # the failed attempt already inserted, instead of leaving them orphaned
+    # under an id nothing ever queries again.
+    run_id_digest = hashlib.sha1(context["dag_run"].run_id.encode()).hexdigest()[:8]
+    load_batch_id = f"{context['ds']}-{run_id_digest}"
 
     data_file = f"/tmp/order_history_fact_{load_batch_id}.csv"
     error_file = f"/tmp/order_history_fact_{load_batch_id}.bcp.err"
+
+    conn = _get_pyodbc_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM order_history_fact WHERE load_batch_id = ?", load_batch_id)
+        if cur.rowcount > 0:
+            log.info(
+                "removed %s row(s) left over from a previous failed attempt of batch %s",
+                cur.rowcount,
+                load_batch_id,
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
     start = time.perf_counter()
     written = 0
@@ -244,6 +265,24 @@ def create_post_load_indexes(**_context) -> None:
         conn.close()
 
 
+def notify_completion(**context) -> None:
+    """Runs whether the DAG succeeded or failed (trigger_rule="all_done"),
+    so there's always a message — not just on the happy path."""
+    dag_run = context["dag_run"]
+    failed_tasks = [ti.task_id for ti in dag_run.get_task_instances() if ti.state == "failed"]
+    if failed_tasks:
+        send_telegram_message(
+            f"[bulk_load_dimensions] falhou — tasks com erro: {', '.join(failed_tasks)} "
+            f"(run {dag_run.run_id})"
+        )
+        return
+
+    rows = context["ti"].xcom_pull(key="rows_written", task_ids="generate_and_load")
+    send_telegram_message(
+        f"[bulk_load_dimensions] carga concluída: {rows} linhas carregadas (run {dag_run.run_id})"
+    )
+
+
 with DAG(
     dag_id="bulk_load_dimensions",
     description="Chunked, memory-safe bulk load of synthetic historical order data into SQL Server",
@@ -258,5 +297,10 @@ with DAG(
     t2 = PythonOperator(task_id="generate_and_load", python_callable=generate_and_load)
     t3 = PythonOperator(task_id="validate_row_count", python_callable=validate_row_count)
     t4 = PythonOperator(task_id="create_post_load_indexes", python_callable=create_post_load_indexes)
+    t5 = PythonOperator(
+        task_id="notify_completion",
+        python_callable=notify_completion,
+        trigger_rule="all_done",  # runs on success AND on failure
+    )
 
-    t1 >> t2 >> t3 >> t4
+    t1 >> t2 >> t3 >> t4 >> t5
