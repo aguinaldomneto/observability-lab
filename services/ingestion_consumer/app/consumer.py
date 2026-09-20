@@ -96,8 +96,15 @@ def process_event(conn: Connection, event: dict[str, Any]) -> dict[str, Any] | N
 
 
 async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> None:
-    event = orjson.loads(msg.value)
-    event_id = event.get("event_id", "<unknown>")
+    try:
+        event = orjson.loads(msg.value)
+        event_id = event["event_id"]
+    except Exception:
+        # Malformed JSON or a missing event_id — not something a retry
+        # would ever fix. Log and move on instead of crashing every
+        # partition this consumer owns over one poison message.
+        log.exception("Malformed message at offset %s — skipping", msg.offset)
+        return
 
     def _run_in_txn() -> dict[str, Any] | None:
         with engine.begin() as conn:
@@ -114,6 +121,12 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         # A single bad message (e.g. rejected by the retroactive-update
         # trigger) must never take down the whole consumer process.
         log.error("DB error processing event %s: %s", event_id, exc)
+        return
+    except Exception:
+        # Same principle for anything process_event itself can raise on a
+        # malformed but valid-JSON payload (e.g. a missing "data" field) —
+        # a bad message must never take the whole consumer down.
+        log.exception("Unexpected error processing event %s — skipping", event_id)
         return
 
     if outbox is not None and outbox["event_type"] == "ORDER_APPROVED":

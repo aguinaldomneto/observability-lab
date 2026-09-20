@@ -1,6 +1,7 @@
 """Thin, stateless webhook edge: validates the payload and hands it to Kafka.
 Never touches SQL Server — see README for why that split matters under load.
 """
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -8,8 +9,11 @@ from typing import Any, Literal
 
 import orjson
 from aiokafka import AIOKafkaProducer
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("webhook-receiver")
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 TOPIC_WEBHOOK_EVENTS = os.environ.get("TOPIC_WEBHOOK_EVENTS", "webhook-events")
@@ -55,7 +59,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/webhooks/events", status_code=202)
-async def receive_webhook(envelope: WebhookEnvelope, request: Request) -> dict[str, str]:
+async def receive_webhook(envelope: WebhookEnvelope) -> dict[str, str]:
     if producer is None:
         raise HTTPException(status_code=503, detail="producer not ready")
 
@@ -79,9 +83,13 @@ async def receive_webhook(envelope: WebhookEnvelope, request: Request) -> dict[s
         }
     )
 
-    await producer.send_and_wait(
-        TOPIC_WEBHOOK_EVENTS,
-        key=partition_key.encode("utf-8"),
-        value=value,
-    )
+    try:
+        await producer.send_and_wait(
+            TOPIC_WEBHOOK_EVENTS,
+            key=partition_key.encode("utf-8"),
+            value=value,
+        )
+    except Exception:
+        log.exception("Failed to publish event %s to Kafka", envelope.event_id)
+        raise HTTPException(status_code=503, detail="event broker unavailable, retry later") from None
     return {"status": "accepted", "event_id": envelope.event_id}

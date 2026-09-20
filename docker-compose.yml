@@ -15,6 +15,7 @@ x-airflow-env: &airflow-env
 services:
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: unless-stopped
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
@@ -33,6 +34,7 @@ services:
 
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    restart: unless-stopped
     command:
       - redpanda
       - start
@@ -84,6 +86,7 @@ services:
   webhook-receiver:
     build:
       context: ./services/webhook_receiver
+    restart: unless-stopped
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
     ports:
@@ -96,6 +99,7 @@ services:
     build:
       context: .
       dockerfile: services/ingestion_consumer/Dockerfile
+    restart: unless-stopped
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: mssql+pyodbc://sa:${MSSQL_SA_PASSWORD}@sqlserver/${MSSQL_DATABASE:-ecommerce}?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
@@ -109,6 +113,7 @@ services:
   order-approved-worker:
     build:
       context: ./services/order_approved_worker
+    restart: unless-stopped
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       EXTERNAL_API_URL: http://mock-external-api:9000/erp/orders
@@ -119,6 +124,7 @@ services:
   mock-external-api:
     build:
       context: ./services/mock_external_api
+    restart: unless-stopped
     environment:
       FAILURE_RATE: ${FAILURE_RATE:-0.3}
     ports:
@@ -126,6 +132,7 @@ services:
 
   airflow-postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
@@ -163,6 +170,7 @@ services:
     build:
       context: ./airflow
     command: webserver
+    restart: unless-stopped
     environment:
       <<: *airflow-env
     ports:
@@ -180,6 +188,7 @@ services:
     build:
       context: ./airflow
     command: scheduler
+    restart: unless-stopped
     environment:
       <<: *airflow-env
     volumes:
