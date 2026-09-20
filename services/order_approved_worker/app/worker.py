@@ -5,6 +5,7 @@ to a dead-letter topic instead of being dropped or blocking the partition.
 import asyncio
 import logging
 import os
+from typing import Any
 
 import httpx
 import orjson
@@ -37,7 +38,7 @@ class TransientDeliveryError(Exception):
     stop=stop_after_attempt(5),
     reraise=True,
 )
-async def deliver(client: httpx.AsyncClient, payload: dict) -> None:
+async def deliver(client: httpx.AsyncClient, payload: dict[str, Any]) -> None:
     try:
         resp = await client.post(EXTERNAL_API_URL, json=payload, timeout=5.0)
     except httpx.TransportError as exc:

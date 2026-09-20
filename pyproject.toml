@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true
+explicit_package_bases = true
+# excluded: this folder is named the same as the apache-airflow package it
+# runs inside, so checking it from the repo root shadows the real "airflow"
+# module. It's still covered by py_compile; a real mypy pass on it needs
+# apache-airflow itself installed.
+exclude = ["^airflow/"]

@@ -16,8 +16,9 @@ import os
 import sys
 import uuid
 
-from airflow import DAG
 from airflow.operators.python import PythonOperator
+
+from airflow import DAG
 
 sys.path.insert(0, "/opt/airflow/scripts")
 from data_generator import generate_rows  # noqa: E402

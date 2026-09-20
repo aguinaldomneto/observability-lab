@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random
-from typing import Iterator
+from collections.abc import Iterator
 
 REGIONS = ["N", "NE", "CO", "SE", "S"]
 CHANNELS = ["WEB", "MOBILE_APP", "MARKETPLACE", "PHONE"]

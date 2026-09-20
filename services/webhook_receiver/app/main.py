@@ -3,13 +3,12 @@ Never touches SQL Server — see README for why that split matters under load.
 """
 import os
 import time
-import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import orjson
 from aiokafka import AIOKafkaProducer
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")

@@ -8,19 +8,21 @@ import asyncio
 import decimal
 import logging
 import os
-
-import orjson
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from sqlalchemy.exc import SQLAlchemyError
+from typing import Any
 
 import db_ops
+import orjson
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
+
 from common.db import get_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ingestion-consumer")
 
 
-def _json_default(value):
+def _json_default(value: Any) -> float:
     """orjson has no native Decimal support (SQL Server NUMERIC columns come
     back from pyodbc as decimal.Decimal); this is the fallback orjson calls
     for anything it doesn't recognize."""
@@ -38,7 +40,7 @@ BATCH_TIMEOUT_MS = int(os.environ.get("BATCH_TIMEOUT_MS", "500"))
 engine = get_engine(pool_size=10, max_overflow=10)
 
 
-def process_event(conn, event: dict) -> dict | None:
+def process_event(conn: Connection, event: dict[str, Any]) -> dict[str, Any] | None:
     """Runs inside an open transaction. Returns an outbox event to publish
     *after* commit, or None."""
     event_id = event["event_id"]
@@ -93,11 +95,11 @@ def process_event(conn, event: dict) -> dict | None:
     return None
 
 
-async def handle_message(msg, producer: AIOKafkaProducer) -> None:
+async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> None:
     event = orjson.loads(msg.value)
     event_id = event.get("event_id", "<unknown>")
 
-    def _run_in_txn():
+    def _run_in_txn() -> dict[str, Any] | None:
         with engine.begin() as conn:
             outbox = process_event(conn, event)
             db_ops.mark_event_processed(conn, event_id)
