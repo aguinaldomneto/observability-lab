@@ -11,6 +11,8 @@ x-airflow-env: &airflow-env
   MSSQL_HOST: sqlserver
   MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
   MSSQL_DATABASE: ${MSSQL_DATABASE:-ecommerce}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
 
 services:
   sqlserver:
@@ -103,12 +105,16 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: mssql+pyodbc://sa:${MSSQL_SA_PASSWORD}@sqlserver/${MSSQL_DATABASE:-ecommerce}?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+    expose:
+      - "9100"  # /metrics, scraped by Prometheus over the internal network
     depends_on:
       migrate:
         condition: service_completed_successfully
       topics-init:
         condition: service_completed_successfully
     # Scale out with: docker compose up -d --scale ingestion-consumer=3
+    # (Prometheus only ever reaches one replica's /metrics this way — see
+    # README, "Monitoramento" — a known limitation of static scrape configs.)
 
   order-approved-worker:
     build:
@@ -117,6 +123,8 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       EXTERNAL_API_URL: http://mock-external-api:9000/erp/orders
+    expose:
+      - "9101"
     depends_on:
       topics-init:
         condition: service_completed_successfully
@@ -208,8 +216,62 @@ services:
       - webhook-receiver
     entrypoint: ["python", "simulate.py", "--url", "http://webhook-receiver:8000/webhooks/events"]
 
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: unless-stopped
+    command: ["--docker_only=true"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    expose:
+      - "8080"
+
+  mssql-exporter:
+    image: awaragi/prometheus-mssql-exporter:latest
+    restart: unless-stopped
+    environment:
+      SERVER: sqlserver
+      USERNAME: sa
+      PASSWORD: ${MSSQL_SA_PASSWORD}
+    expose:
+      - "4000"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - cadvisor
+      - mssql-exporter
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   sqlserver_data:
   redpanda_data:
   airflow_pg_data:
   airflow_logs:
+  prometheus_data:
+  grafana_data:

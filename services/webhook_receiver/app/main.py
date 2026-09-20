@@ -9,7 +9,8 @@ from typing import Any, Literal
 
 import orjson
 from aiokafka import AIOKafkaProducer
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -17,6 +18,13 @@ log = logging.getLogger("webhook-receiver")
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 TOPIC_WEBHOOK_EVENTS = os.environ.get("TOPIC_WEBHOOK_EVENTS", "webhook-events")
+
+webhooks_received_total = Counter(
+    "webhooks_received_total", "Webhooks accepted and published to Kafka", ["event_type"]
+)
+webhook_publish_failures_total = Counter(
+    "webhook_publish_failures_total", "Webhooks that failed to publish to Kafka"
+)
 
 producer: AIOKafkaProducer | None = None
 
@@ -58,6 +66,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/webhooks/events", status_code=202)
 async def receive_webhook(envelope: WebhookEnvelope) -> dict[str, str]:
     if producer is None:
@@ -91,5 +104,7 @@ async def receive_webhook(envelope: WebhookEnvelope) -> dict[str, str]:
         )
     except Exception:
         log.exception("Failed to publish event %s to Kafka", envelope.event_id)
+        webhook_publish_failures_total.inc()
         raise HTTPException(status_code=503, detail="event broker unavailable, retry later") from None
+    webhooks_received_total.labels(event_type=envelope.event_type).inc()
     return {"status": "accepted", "event_id": envelope.event_id}

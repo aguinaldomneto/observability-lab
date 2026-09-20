@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from prometheus_client import Counter, start_http_server
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -25,6 +26,9 @@ TOPIC_ORDER_APPROVED = os.environ.get("TOPIC_ORDER_APPROVED", "order-approved")
 TOPIC_DLQ = os.environ.get("TOPIC_ORDER_APPROVED_DLQ", "order-approved-dlq")
 CONSUMER_GROUP = os.environ.get("CONSUMER_GROUP", "order-approved-worker")
 EXTERNAL_API_URL = os.environ.get("EXTERNAL_API_URL", "http://mock-external-api:9000/erp/orders")
+METRICS_PORT = int(os.environ.get("METRICS_PORT", "9101"))
+
+deliveries_total = Counter("deliveries_total", "Order deliveries to the external ERP", ["outcome"])
 
 
 class TransientDeliveryError(Exception):
@@ -49,6 +53,7 @@ async def deliver(client: httpx.AsyncClient, payload: dict[str, Any]) -> None:
 
 
 async def main() -> None:
+    start_http_server(METRICS_PORT)
     consumer = AIOKafkaConsumer(
         TOPIC_ORDER_APPROVED,
         bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -70,6 +75,7 @@ async def main() -> None:
                 try:
                     await deliver(client, payload)
                     log.info("Delivered order_id=%s to external ERP", order_id)
+                    deliveries_total.labels(outcome="success").inc()
                 except (TransientDeliveryError, httpx.HTTPStatusError) as exc:
                     # TransientDeliveryError here means @retry's 5 attempts were
                     # exhausted (reraise=True re-raises the original exception,
@@ -80,6 +86,7 @@ async def main() -> None:
                         "Failed to deliver order_id=%s (%s) — routing to DLQ", order_id, exc
                     )
                     await producer.send_and_wait(TOPIC_DLQ, value=msg.value, key=msg.key)
+                    deliveries_total.labels(outcome="dlq").inc()
                 await consumer.commit()
         finally:
             await consumer.stop()

@@ -13,6 +13,7 @@ from typing import Any
 import db_ops
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord
+from prometheus_client import Counter, start_http_server
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
@@ -21,6 +22,11 @@ from common.db import get_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ingestion-consumer")
+
+METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
+events_processed_total = Counter(
+    "events_processed_total", "Webhook events processed", ["event_type", "outcome"]
+)
 
 
 def _json_default(value: Any) -> float:
@@ -108,6 +114,7 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         db_ops.log_pipeline_event(
             engine, "ingestion-consumer", "ERROR", f"malformed message at offset {msg.offset}: {exc}"
         )
+        events_processed_total.labels(event_type="unknown", outcome="malformed").inc()
         return
 
     # OperationalError covers deadlocks, lock-wait timeouts (see
@@ -132,12 +139,14 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         outbox = await asyncio.to_thread(_run_in_txn)
     except db_ops.DuplicateEvent:
         log.info("Duplicate event %s — already processed, skipping (idempotent no-op)", event_id)
+        events_processed_total.labels(event_type=event["event_type"], outcome="duplicate").inc()
         return
     except OperationalError as exc:
         log.error("DB still unavailable/blocked after retries for event %s: %s", event_id, exc)
         db_ops.log_pipeline_event(
             engine, "ingestion-consumer", "ERROR", f"DB unavailable after retries: {exc}", event_id
         )
+        events_processed_total.labels(event_type=event["event_type"], outcome="db_unavailable").inc()
         return
     except SQLAlchemyError as exc:
         # Not retried: data errors (e.g. truncation) or a rejected write
@@ -146,6 +155,7 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         # whole consumer process.
         log.error("DB error processing event %s: %s", event_id, exc)
         db_ops.log_pipeline_event(engine, "ingestion-consumer", "ERROR", f"DB error: {exc}", event_id)
+        events_processed_total.labels(event_type=event["event_type"], outcome="db_error").inc()
         return
     except Exception as exc:
         # Same principle for anything process_event itself can raise on a
@@ -155,7 +165,10 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
         db_ops.log_pipeline_event(
             engine, "ingestion-consumer", "ERROR", f"unexpected error: {exc}", event_id
         )
+        events_processed_total.labels(event_type="unknown", outcome="unexpected_error").inc()
         return
+
+    events_processed_total.labels(event_type=event["event_type"], outcome="success").inc()
 
     if outbox is not None and outbox["event_type"] == "ORDER_APPROVED":
         try:
@@ -182,9 +195,11 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
                 f"ORDER_APPROVED publish failed for order_id={order_id}: {exc}",
                 event_id,
             )
+            events_processed_total.labels(event_type="ORDER_APPROVED", outcome="publish_failed").inc()
 
 
 async def main() -> None:
+    start_http_server(METRICS_PORT)
     consumer = AIOKafkaConsumer(
         TOPIC_WEBHOOK_EVENTS,
         bootstrap_servers=KAFKA_BOOTSTRAP,

@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: pipeline
+    folder: Pipeline
+    type: file
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
