@@ -1,6 +1,6 @@
 # Pipeline de e-commerce em larga escala
 
-Este é um protótipo de ponta a ponta pra um cenário clássico de e-commerce em alta escala: chega um webhook de pedido, esse pedido precisa ser gravado sem duplicar mesmo sob concorrência pesada, o histórico de endereço e status não pode se perder, e quando um pedido é aprovado um ERP externo (fictício, aqui) precisa ser notificado sem depender de polling. Além disso tem uma carga analítica de 10 milhões de linhas que precisa entrar no banco o mais rápido possível.
+Este é um protótipo de ponta a ponta pra um cenário clássico de e-commerce em alta escala: chega um webhook de pedido, esse pedido precisa ser gravado sem duplicar mesmo sob concorrência pesada, o histórico de endereço e status não pode se perder, e quando um pedido é aprovado um ERP externo (fictício, aqui) precisa ser notificado sem depender de polling. Além disso tem uma carga analítica de 10 milhões de linhas pra popular uma tabela de histórico.
 
 O projeto nasceu de um desafio técnico de nível sênior, mas ficou como material de estudo/portfólio: dá pra usar como referência de como lidar com idempotência, concorrência, modelagem com auditoria histórica e carga em massa no SQL Server.
 
@@ -57,6 +57,7 @@ O webhook chega numa API HTTP fina (`webhook-receiver`) que só valida e publica
 │   ├── mock_external_api/   # ERP fictício, com falha configurável pra testar o retry
 │   └── load_simulator/      # dispara uma carga de webhooks pra testar idempotência/concorrência
 ├── docker-compose.yml
+├── pyproject.toml           # config do ruff (lint) e mypy (checagem de tipos)
 └── .env.example
 ```
 
@@ -74,29 +75,31 @@ Você precisa de:
 
 ```bash
 cp .env.example .env   # dá pra trocar a senha do SA se quiser
+docker compose up -d --build
 ```
 
-Sobe o banco e o Kafka primeiro, e aplica as migrations:
+Só isso. Um comando sobe a stack inteira — SQL Server, Redpanda, os quatro serviços Python e o Airflow completo (Postgres de metadados, init, webserver e scheduler) — na ordem certa, sozinho. Isso funciona porque cada serviço declara no `docker-compose.yml` do que ele depende e em que condição (`condition: service_healthy` ou `service_completed_successfully`): o `migrate` só roda depois que o SQL Server responde ao healthcheck, o `ingestion-consumer` só sobe depois que o `migrate` e o `topics-init` terminam com sucesso, e assim por diante. Você não precisa orquestrar isso na mão.
+
+`docker compose up -d --build` sozinho não sobe o `load-simulator` — ele fica fora de propósito (tem `profiles: ["tools"]` no compose), porque é uma ferramenta de teste que você dispara sob demanda, não um serviço de fundo.
+
+Na primeira subida, o SQL Server pode levar entre 30 segundos e um par de minutos pra ficar pronto (é uma imagem pesada) — os serviços que dependem dele esperam automaticamente, então não é preciso reagir a isso, só ter paciência. Se quiser acompanhar o progresso:
+
+```bash
+docker compose ps        # mostra o status/healthcheck de cada serviço
+docker compose logs -f sqlserver
+```
+
+O Airflow fica em `http://localhost:8080` (login `admin`/`admin`, a menos que você tenha mudado no `.env`).
+
+Se algo der errado e você quiser isolar em qual etapa travou, dá pra subir por partes, na ordem que o compose já respeitaria sozinho:
 
 ```bash
 docker compose up -d --build sqlserver redpanda topics-init
 docker compose up --build migrate
-```
-
-Depois os serviços da esteira de ingestão e o ERP fictício:
-
-```bash
 docker compose up -d --build webhook-receiver ingestion-consumer \
     order-approved-worker mock-external-api
-```
-
-E por fim o Airflow (usado só pela carga de 10M linhas):
-
-```bash
 docker compose up -d --build airflow-postgres airflow-init airflow-webserver airflow-scheduler
 ```
-
-O Airflow fica em `http://localhost:8080` (login `admin`/`admin`, a menos que você tenha mudado no `.env`).
 
 ## Testando a ingestão: idempotência e concorrência
 
@@ -210,7 +213,7 @@ Vale registrar que ambas as medições foram feitas numa única máquina rodando
 - **Não tem testes automatizados além do gerador de dados** (`airflow/scripts/test_data_generator.py`). A cobertura de idempotência e concorrência hoje é validada rodando o `load-simulator` manualmente contra um ambiente de verdade, não por um teste que roda em CI.
 - **A máquina de teste roda a stack inteira junto**, o que pode mascarar parte do ganho real da técnica de carga em massa — isso é uma limitação do ambiente, não motivo pra não medir.
 
-## Rodando os testes
+## Rodando os testes e o lint
 
 O único componente com testes automatizados hoje é o gerador de dados da carga em massa, porque é a única peça que não depende de nenhuma infraestrutura externa:
 
@@ -218,4 +221,12 @@ O único componente com testes automatizados hoje é o gerador de dados da carga
 pip install pytest
 cd airflow/scripts
 pytest -v
+```
+
+Lint e checagem de tipos (config em `pyproject.toml`) rodam sobre o projeto inteiro:
+
+```bash
+pip install ruff mypy
+ruff check .
+mypy .
 ```

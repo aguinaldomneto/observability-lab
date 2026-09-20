@@ -21,7 +21,7 @@ import httpx
 WEBHOOK_URL_DEFAULT = "http://localhost:8000/webhooks/events"
 
 
-def make_order_created(order_seq: int) -> dict[str, Any]:
+def make_order_created(order_seq: int) -> tuple[dict[str, Any], str]:
     external_order_id = f"ORD-{order_seq:08d}"
     external_client_id = f"CLI-{order_seq % 5000:06d}"
     return {
@@ -82,7 +82,9 @@ def make_payment_confirmed(order_seq: int, external_order_id: str) -> dict[str, 
     }
 
 
-async def send(client: httpx.AsyncClient, url: str, payload: dict, results: list) -> None:
+async def send(
+    client: httpx.AsyncClient, url: str, payload: dict[str, Any], results: list[tuple[int, float]]
+) -> None:
     start = time.perf_counter()
     try:
         resp = await client.post(url, json=payload, timeout=10.0)
@@ -96,7 +98,7 @@ async def run(args: argparse.Namespace) -> None:
     sem = asyncio.Semaphore(args.concurrency)
     results: list[tuple[int, float]] = []
 
-    async def bounded_send(client, url, payload):
+    async def bounded_send(client: httpx.AsyncClient, url: str, payload: dict[str, Any]) -> None:
         async with sem:
             await send(client, url, payload, results)
 
