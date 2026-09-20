@@ -1,8 +1,13 @@
 """Shared SQL Server connection factory used by the ingestion consumer."""
 import os
+from typing import Any
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
+
+# Fail a blocked statement after this long instead of waiting on a lock
+# forever — turns a silent hang into a catchable OperationalError.
+LOCK_TIMEOUT_MS = 10_000
 
 
 def get_database_url() -> str:
@@ -17,7 +22,7 @@ def get_engine(pool_size: int = 5, max_overflow: int = 5) -> Engine:
     # native array-binding protocol instead of one round-trip per row.
     # pool_size/max_overflow stay small on purpose so no single service
     # instance can flood SQL Server with connections under load.
-    return create_engine(
+    engine = create_engine(
         get_database_url(),
         fast_executemany=True,
         pool_size=pool_size,
@@ -27,3 +32,11 @@ def get_engine(pool_size: int = 5, max_overflow: int = 5) -> Engine:
         pool_pre_ping=True,
         future=True,
     )
+
+    @event.listens_for(engine, "connect")
+    def _set_lock_timeout(dbapi_connection: Any, connection_record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"SET LOCK_TIMEOUT {LOCK_TIMEOUT_MS}")
+        cursor.close()
+
+    return engine

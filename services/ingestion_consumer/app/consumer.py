@@ -14,7 +14,8 @@ import db_ops
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from common.db import get_engine
 
@@ -96,9 +97,28 @@ def process_event(conn: Connection, event: dict[str, Any]) -> dict[str, Any] | N
 
 
 async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> None:
-    event = orjson.loads(msg.value)
-    event_id = event.get("event_id", "<unknown>")
+    try:
+        event = orjson.loads(msg.value)
+        event_id = event["event_id"]
+    except Exception:
+        # Malformed JSON or a missing event_id — not something a retry
+        # would ever fix. Log and move on instead of crashing every
+        # partition this consumer owns over one poison message.
+        log.exception("Malformed message at offset %s — skipping", msg.offset)
+        return
 
+    # OperationalError covers deadlocks, lock-wait timeouts (see
+    # common.db's SET LOCK_TIMEOUT) and dropped connections — genuinely
+    # transient conditions worth a few quick retries. reraise=True means
+    # tenacity re-raises this same exception type once attempts are
+    # exhausted, not tenacity.RetryError — the except clause below relies
+    # on that.
+    @retry(
+        retry=retry_if_exception_type(OperationalError),
+        wait=wait_exponential_jitter(initial=0.2, max=2),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
     def _run_in_txn() -> dict[str, Any] | None:
         with engine.begin() as conn:
             outbox = process_event(conn, event)
@@ -110,10 +130,21 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
     except db_ops.DuplicateEvent:
         log.info("Duplicate event %s — already processed, skipping (idempotent no-op)", event_id)
         return
+    except OperationalError as exc:
+        log.error("DB still unavailable/blocked after retries for event %s: %s", event_id, exc)
+        return
     except SQLAlchemyError as exc:
-        # A single bad message (e.g. rejected by the retroactive-update
-        # trigger) must never take down the whole consumer process.
+        # Not retried: data errors (e.g. truncation) or a rejected write
+        # (e.g. the retroactive-update trigger) will fail identically
+        # every time. A single bad message must never take down the
+        # whole consumer process.
         log.error("DB error processing event %s: %s", event_id, exc)
+        return
+    except Exception:
+        # Same principle for anything process_event itself can raise on a
+        # malformed but valid-JSON payload (e.g. a missing "data" field) —
+        # a bad message must never take the whole consumer down.
+        log.exception("Unexpected error processing event %s — skipping", event_id)
         return
 
     if outbox is not None and outbox["event_type"] == "ORDER_APPROVED":

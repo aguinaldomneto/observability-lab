@@ -70,6 +70,9 @@ def _get_pyodbc_connection():
 
     dsn = os.environ["MSSQL_ODBC_DSN"]
     conn = pyodbc.connect(dsn, autocommit=False)
+    # Fail fast on a blocked statement instead of hanging the task forever.
+    conn.cursor().execute("SET LOCK_TIMEOUT 10000")
+    conn.commit()
     return conn
 
 
@@ -171,8 +174,19 @@ def generate_and_load(**context) -> None:
             # Encrypt/Decrypt operations".
             "-a", "16384",
         ]
+        bcp_timeout = int(os.environ.get("BCP_TIMEOUT_SECONDS", "7200"))
         bcp_start = time.perf_counter()
-        result = subprocess.run(bcp_cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                bcp_cmd, capture_output=True, text=True, timeout=bcp_timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A hung bcp (e.g. the network dropping mid-transfer) would
+            # otherwise block this task forever instead of failing and
+            # letting Airflow's own retry pick it up.
+            raise RuntimeError(
+                f"bcp did not finish within {bcp_timeout}s loading {data_file}"
+            ) from exc
         bcp_elapsed = time.perf_counter() - bcp_start
         log.info("bcp stdout:\n%s", result.stdout)
         if result.returncode != 0:
@@ -236,6 +250,7 @@ with DAG(
     start_date=dt.datetime(2026, 1, 1),
     schedule=None,  # triggered manually / on demand, like a historical backfill
     catchup=False,
+    max_active_runs=1,  # two concurrent runs would fight over the same TABLOCK
     default_args={"retries": 1, "retry_delay": dt.timedelta(minutes=2)},
     tags=["bulk-load", "sql-server", "performance", "bcp", "minimal-logging"],
 ) as dag:

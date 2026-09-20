@@ -11,7 +11,6 @@ import httpx
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from tenacity import (
-    RetryError,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -71,9 +70,14 @@ async def main() -> None:
                 try:
                     await deliver(client, payload)
                     log.info("Delivered order_id=%s to external ERP", order_id)
-                except RetryError:
+                except (TransientDeliveryError, httpx.HTTPStatusError) as exc:
+                    # TransientDeliveryError here means @retry's 5 attempts were
+                    # exhausted (reraise=True re-raises the original exception,
+                    # not tenacity.RetryError — routing on RetryError was dead
+                    # code that let an exhausted delivery crash the process).
+                    # HTTPStatusError is a non-retryable 4xx from the ERP.
                     log.error(
-                        "Exhausted retries delivering order_id=%s — routing to DLQ", order_id
+                        "Failed to deliver order_id=%s (%s) — routing to DLQ", order_id, exc
                     )
                     await producer.send_and_wait(TOPIC_DLQ, value=msg.value, key=msg.key)
                 await consumer.commit()

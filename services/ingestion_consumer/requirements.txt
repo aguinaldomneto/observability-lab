@@ -4,3 +4,4 @@ pyodbc==5.1.0
 orjson==3.10.7
 python-dotenv==1.0.1
 cramjam==2.12.1
+tenacity==9.0.0
