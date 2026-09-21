@@ -23,6 +23,7 @@ from airflow import DAG
 sys.path.insert(0, "/opt/airflow/scripts")
 from data_generator import generate_rows  # noqa: E402
 from notify import send_telegram_message  # noqa: E402
+from run_history import record_run  # noqa: E402
 
 DEFAULT_TOTAL_ROWS = 10_000_000
 DEFAULT_BATCH_SIZE = 50_000
@@ -271,6 +272,7 @@ def notify_completion(**context) -> None:
     dag_run = context["dag_run"]
     failed_tasks = [ti.task_id for ti in dag_run.get_task_instances() if ti.state == "failed"]
     if failed_tasks:
+        record_run("failed", dag_run.run_id, f"failed tasks: {', '.join(failed_tasks)}")
         send_telegram_message(
             f"[bulk_load_dimensions] falhou — tasks com erro: {', '.join(failed_tasks)} "
             f"(run {dag_run.run_id})"
@@ -278,6 +280,7 @@ def notify_completion(**context) -> None:
         return
 
     rows = context["ti"].xcom_pull(key="rows_written", task_ids="generate_and_load")
+    record_run("success", dag_run.run_id, f"rows={rows}")
     send_telegram_message(
         f"[bulk_load_dimensions] carga concluída: {rows} linhas carregadas (run {dag_run.run_id})"
     )
