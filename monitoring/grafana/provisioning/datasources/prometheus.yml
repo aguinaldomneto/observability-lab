@@ -3,6 +3,11 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    # Fixed uid: the dashboard JSON (pipeline.json) hardcodes
+    # datasource.uid: "prometheus" on every panel. Without pinning it here,
+    # Grafana assigns a random uid on first boot that never matches, and
+    # every panel fails with "Datasource prometheus was not found".
+    uid: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
