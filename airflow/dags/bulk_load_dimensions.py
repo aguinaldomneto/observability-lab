@@ -138,16 +138,18 @@ def generate_and_load(**context) -> None:
     conn = _get_pyodbc_connection()
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM order_history_fact WHERE load_batch_id = ?", load_batch_id)
-        if cur.rowcount > 0:
-            log.info(
-                "removed %s row(s) left over from a previous failed attempt of batch %s",
-                cur.rowcount,
-                load_batch_id,
-            )
+        # external_order_id is generated positionally (HIST-0000000000, ...)
+        # starting from 0 on every call, with no persisted offset — two full
+        # loads produce the exact same 10M order ids under different
+        # load_batch_id/loaded_at values. Truncating here makes each trigger
+        # replace the historical snapshot instead of silently duplicating
+        # every order; it also covers the retry-safety case the old
+        # per-batch DELETE handled (orphaned rows from a failed attempt).
+        cur.execute("TRUNCATE TABLE order_history_fact")
         conn.commit()
     finally:
         conn.close()
+    log.info("order_history_fact truncated, starting fresh load as batch %s", load_batch_id)
 
     start = time.perf_counter()
     written = 0

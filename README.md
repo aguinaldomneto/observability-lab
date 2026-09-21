@@ -155,6 +155,8 @@ docker compose exec airflow-scheduler airflow dags trigger bulk_load_dimensions 
     --conf '{"total_rows": 100000, "batch_size": 10000}'
 ```
 
+Cada disparo **substitui** o conteúdo de `order_history_fact` (a DAG dá `TRUNCATE` antes de carregar) em vez de acumular por cima do anterior — os dados são sintéticos e gerados sempre a partir do mesmo `external_order_id` (`HIST-0000000000`, ...), então rodar de novo sem truncar antes duplicaria o mesmo pedido histórico sob um `load_batch_id` novo.
+
 **Evite rodar o `load-simulator` (seção abaixo) ao mesmo tempo que essa carga.** São dois pipelines sem nenhum controle de concorrência entre si, competindo pelo mesmo SQL Server (`mem_limit: 2g`) na mesma máquina que roda o resto da stack — numa máquina de teste comum isso derruba a latência do `webhook-receiver` pra vários segundos por requisição e pode até derrubar conexões, não porque tenha algo quebrado, só porque estão brigando pelo mesmo recurso limitado ao mesmo tempo. Se quiser disparar as duas cargas, espere uma terminar antes de começar a outra.
 
 Se disparar a DAG de novo enquanto uma execução anterior ainda está rodando, o Airflow enfileira a nova automaticamente (`max_active_runs=1` na definição da DAG) — não roda as duas juntas, e não precisa confirmar nada na mão.
