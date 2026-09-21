@@ -64,6 +64,20 @@ POST_LOAD_INDEXES_SQL = [
     "UPDATE STATISTICS order_history_fact",
 ]
 
+# Mirrors the index names in POST_LOAD_INDEXES_SQL. Without this, a second
+# run of the DAG hits `bcp` with these three indexes already in place (the
+# first run's create_post_load_indexes never gets undone), which disqualifies
+# the load from minimal logging just as surely as a secondary index the DAG
+# never dropped in the first place.
+PRE_LOAD_DROP_INDEXES_SQL = [
+    "IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_ohf_order_date') "
+    "DROP INDEX ix_ohf_order_date ON order_history_fact",
+    "IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_ohf_region_channel') "
+    "DROP INDEX ix_ohf_region_channel ON order_history_fact",
+    "IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_ohf_load_batch') "
+    "DROP INDEX ix_ohf_load_batch ON order_history_fact",
+]
+
 
 def _get_pyodbc_connection():
     import os
@@ -138,6 +152,11 @@ def generate_and_load(**context) -> None:
     conn = _get_pyodbc_connection()
     try:
         cur = conn.cursor()
+        # Undo create_post_load_indexes from a previous run: bcp needs the
+        # table free of secondary indexes to qualify for minimal logging,
+        # same as it does on a brand-new table.
+        for stmt in PRE_LOAD_DROP_INDEXES_SQL:
+            cur.execute(stmt)
         # external_order_id is generated positionally (HIST-0000000000, ...)
         # starting from 0 on every call, with no persisted offset — two full
         # loads produce the exact same 10M order ids under different
@@ -149,7 +168,7 @@ def generate_and_load(**context) -> None:
         conn.commit()
     finally:
         conn.close()
-    log.info("order_history_fact truncated, starting fresh load as batch %s", load_batch_id)
+    log.info("order_history_fact reset (indexes dropped, table truncated), loading batch %s", load_batch_id)
 
     start = time.perf_counter()
     written = 0
