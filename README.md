@@ -173,6 +173,27 @@ Uma linha por execução, tipo:
 2026-09-21 06:45:12 UTC | run=manual__2026-09-21T06:18:44+00:00 | status=success | rows=10000000
 ```
 
+### Acompanhando a carga em tempo real
+
+Enquanto o `bcp` está rodando com `TABLOCK`, uma consulta comum fica esperando o lock até o load terminar. Pra ver a tabela enchendo ao vivo, usa `NOLOCK` (lê o que já foi comitado, sem esperar):
+
+```bash
+while true; do
+  docker compose exec sqlserver bash -c 'sqlcmd -C -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -d ecommerce -Q "SELECT COUNT(*) AS linhas_ate_agora FROM order_history_fact WITH (NOLOCK);"'
+  sleep 10
+done
+```
+
+Duas coisas pra não estranhar o comportamento: fica em zero durante a fase de geração do arquivo intermediário (uns 10min pros 10M default, antes do `bcp` sequer começar a inserir), e depois sobe em degraus de `batch_size` (50 mil por padrão) em vez de crescer suavemente — o `bcp` só comita a cada lote completo.
+
+O painel **CPU/Memória por container** do Grafana (seção "Monitoramento" abaixo) também serve como sinal em tempo real durante a carga — o `sqlserver` deve aparecer no talo de CPU enquanto o `bcp` está inserindo.
+
+Depois que a execução termina, pra saber quanto tempo ela levou (e comparar com os números de referência da seção "A carga de 10 milhões de linhas"):
+
+```bash
+docker compose exec airflow-scheduler bash -c 'ls -t /opt/airflow/logs/dag_id=bulk_load_dimensions/run_id=*/task_id=generate_and_load/attempt=1.log | head -1 | xargs grep "done:"'
+```
+
 ## Desligando tudo
 
 ```bash
@@ -226,7 +247,9 @@ A rodada de cada hora é suficiente pra manter isso sob controle mesmo numa raja
 
 ## Monitoramento
 
-Prometheus e Grafana sobem junto com o resto (fazem parte do `docker compose up -d --build`). Grafana fica em `http://localhost:3000` (login `admin`/`admin`, a menos que você tenha mudado `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD` no `.env`) e já vem com a fonte de dados do Prometheus e um dashboard (`Pipeline de e-commerce`) provisionados — não precisa configurar nada na mão.
+Prometheus e Grafana sobem junto com o resto (fazem parte do `docker compose up -d --build`). Grafana fica em `http://localhost:3000` (login `admin`/`admin`, a menos que você tenha mudado `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD` no `.env`) e já vem com a fonte de dados do Prometheus e um dashboard (`Pipeline de e-commerce`) provisionados — não precisa configurar nada na mão. O dashboard abre com a janela `Last 1h` e atualização automática a cada 10s.
+
+O datasource do Prometheus é provisionado com `uid: prometheus` fixo (`monitoring/grafana/provisioning/datasources/prometheus.yml`) de propósito: o dashboard (`monitoring/grafana/dashboards/pipeline.json`) referencia esse uid em todo painel. Sem fixar, o Grafana gera um uid aleatório no primeiro boot que nunca bate com o esperado, e todo painel falha com `Datasource prometheus was not found`.
 
 O que o dashboard mostra:
 
@@ -237,10 +260,34 @@ As métricas de negócio vêm direto dos 4 serviços Python (`prometheus_client`
 
 **Sobre o `cAdvisor` e cgroup v2**: em host com cgroup v2 (padrão em distros recentes, Debian 13 incluso), o Docker isola cada container no próprio namespace de cgroup por padrão — sem ajuste, o `cAdvisor` só enxerga o cgroup dele mesmo (`id="/"` no Prometheus) e nunca descobre os containers vizinhos, então os painéis de CPU/memória ficam vazios mesmo com o scrape funcionando. O `docker-compose.yml` já vem com `cgroup: host` no serviço `cadvisor` pra resolver isso — se algum dia você tirar essa linha achando que é redundante, os painéis de infraestrutura voltam a ficar em branco.
 
+**Sobre o `cAdvisor` e o containerd image store do Docker**: em Docker recente (28+/29+) o storage backend padrão passou a ser o snapshotter do containerd — `docker info` mostra `Storage Driver: overlayfs` (sem o "2") nesse caso. O cAdvisor v0.49.1 não sabe ler essa estrutura nova: ele descobre os containers pelo cgroup normalmente, mas falha ao criar cada um com `failed to identify the read-write layer ID` (procurando um arquivo que só existe no layout clássico do overlay2), e o sintoma no Prometheus é o mesmo do caso do cgroup v2 acima — só a métrica com `id="/"`. `docker compose logs cadvisor` mostra esse erro claramente quando é isso. A correção é desativar o snapshotter novo no daemon do Docker (não é algo que o `docker-compose.yml` deste projeto controla, é configuração da máquina host):
+
+```bash
+sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
+{
+  "features": { "containerd-snapshotter": false }
+}
+EOF
+sudo systemctl restart docker
+```
+
+Depois disso `docker info | grep -i "storage driver"` deve mostrar `overlay2`, e os containers precisam ser recriados (`docker compose up -d --build`) — os dados continuam intactos, ficam em volumes nomeados que não dependem do storage driver de imagem.
+
 Duas ressalvas honestas:
 
 - **Painéis de SQL Server/Redpanda são só de disponibilidade (`up`), não de performance.** Os nomes exatos das métricas que o `mssql-exporter` e o Redpanda expõem variam por versão, e eu não tenho como validar isso contra uma instância rodando de verdade aqui — em vez de arriscar um painel com uma métrica que não existe (e que renderiza vazio sem avisar por quê), deixei só a confirmação de que o Prometheus está conseguindo coletar de cada um. Dá pra abrir `http://localhost:9090/targets` pra confirmar os scrapes, olhar o `/metrics` de cada exporter e completar os painéis com os nomes reais.
 - **Escalar o `ingestion-consumer` (`--scale ingestion-consumer=3`) faz o Prometheus enxergar só uma das réplicas.** O scrape aqui é estático (`ingestion-consumer:9100`), e a resolução de DNS do Compose não garante rodízio confiável entre múltiplas réplicas do mesmo serviço — pra métricas por réplica de verdade, precisaria de service discovery (Docker Swarm, ou um `file_sd` com IPs atualizados dinamicamente), fora do escopo deste projeto.
+
+### Notificações no Telegram
+
+A DAG `bulk_load_dimensions` manda uma mensagem ao Telegram quando termina — de sucesso ou de falha, sempre (`trigger_rule="all_done"` na task `notify_completion`, ver `airflow/dags/bulk_load_dimensions.py`). Pra ativar, configure no `.env`:
+
+```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+Sem essas variáveis, o envio é só pulado (com um aviso no log do Airflow) — nunca derruba a DAG por causa disso. É a forma de saber que uma carga de 10M terminou sem precisar ficar com o Airflow aberto esperando.
 
 ## Modelagem: o que cada tabela resolve
 
