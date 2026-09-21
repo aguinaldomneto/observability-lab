@@ -155,6 +155,22 @@ docker compose exec airflow-scheduler airflow dags trigger bulk_load_dimensions 
     --conf '{"total_rows": 100000, "batch_size": 10000}'
 ```
 
+**Evite rodar o `load-simulator` (seção abaixo) ao mesmo tempo que essa carga.** São dois pipelines sem nenhum controle de concorrência entre si, competindo pelo mesmo SQL Server (`mem_limit: 2g`) na mesma máquina que roda o resto da stack — numa máquina de teste comum isso derruba a latência do `webhook-receiver` pra vários segundos por requisição e pode até derrubar conexões, não porque tenha algo quebrado, só porque estão brigando pelo mesmo recurso limitado ao mesmo tempo. Se quiser disparar as duas cargas, espere uma terminar antes de começar a outra.
+
+Se disparar a DAG de novo enquanto uma execução anterior ainda está rodando, o Airflow enfileira a nova automaticamente (`max_active_runs=1` na definição da DAG) — não roda as duas juntas, e não precisa confirmar nada na mão.
+
+Cada execução (sucesso ou falha) fica registrada num arquivo só, que dá pra acompanhar com `tail -f`:
+
+```bash
+docker compose exec airflow-scheduler tail -f /opt/airflow/logs/run-history/bulk_load_dimensions.log
+```
+
+Uma linha por execução, tipo:
+
+```
+2026-09-21 06:45:12 UTC | run=manual__2026-09-21T06:18:44+00:00 | status=success | rows=10000000
+```
+
 ## Desligando tudo
 
 ```bash
