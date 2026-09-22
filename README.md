@@ -1,4 +1,4 @@
-# Pipeline de e-commerce em larga escala
+# Observability & Event-Driven Architecture Lab
 
 Este é um protótipo de ponta a ponta pra um cenário clássico de e-commerce em alta escala: chega um webhook de pedido, esse pedido precisa ser gravado sem duplicar mesmo sob concorrência pesada, o histórico de endereço e status não pode se perder, e quando um pedido é aprovado um ERP externo (fictício, aqui) precisa ser notificado sem depender de polling. Além disso tem uma carga analítica de 10 milhões de linhas pra popular uma tabela de histórico.
 
