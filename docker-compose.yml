@@ -87,10 +87,12 @@ services:
 
   webhook-receiver:
     build:
-      context: ./services/webhook_receiver
+      context: .
+      dockerfile: services/webhook_receiver/Dockerfile
     restart: unless-stopped
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     ports:
       - "8000:8000"
     depends_on:
@@ -105,6 +107,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: mssql+pyodbc://sa:${MSSQL_SA_PASSWORD}@sqlserver/${MSSQL_DATABASE:-ecommerce}?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     expose:
       - "9100"  # /metrics, scraped by Prometheus over the internal network
     depends_on:
@@ -118,11 +121,13 @@ services:
 
   order-approved-worker:
     build:
-      context: ./services/order_approved_worker
+      context: .
+      dockerfile: services/order_approved_worker/Dockerfile
     restart: unless-stopped
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       EXTERNAL_API_URL: http://mock-external-api:9000/erp/orders
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     expose:
       - "9101"
     depends_on:
@@ -131,10 +136,12 @@ services:
 
   mock-external-api:
     build:
-      context: ./services/mock_external_api
+      context: .
+      dockerfile: services/mock_external_api/Dockerfile
     restart: unless-stopped
     environment:
       FAILURE_RATE: ${FAILURE_RATE:-0.3}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     ports:
       - "9000:9000"
 
@@ -245,6 +252,31 @@ services:
       sqlserver:
         condition: service_healthy
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./monitoring/otel/collector.yml:/etc/otelcol/config.yml:ro
+    expose:
+      - "4317"  # OTLP/gRPC, only reachable inside the compose network
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.0
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    # root: the named volume is created root-owned and Tempo's default
+    # user (10001) can't write its WAL into it.
+    user: "0"
+    volumes:
+      - ./monitoring/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_data:/var/tempo
+    expose:
+      - "3200"
+      - "4317"
+
   prometheus:
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
@@ -271,6 +303,7 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+      - tempo
 
 volumes:
   sqlserver_data:
@@ -279,3 +312,4 @@ volumes:
   airflow_logs:
   prometheus_data:
   grafana_data:
+  tempo_data:

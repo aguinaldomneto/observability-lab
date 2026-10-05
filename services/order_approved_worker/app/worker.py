@@ -10,6 +10,8 @@ from typing import Any
 import httpx
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from opentelemetry import trace
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from prometheus_client import Counter, start_http_server
 from tenacity import (
     retry,
@@ -18,8 +20,12 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
+from common.telemetry import extract_kafka_context, inject_kafka_headers, setup_tracing
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("order-approved-worker")
+tracer = setup_tracing("order-approved-worker")
+HTTPXClientInstrumentor().instrument()
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 TOPIC_ORDER_APPROVED = os.environ.get("TOPIC_ORDER_APPROVED", "order-approved")
@@ -72,21 +78,36 @@ async def main() -> None:
             async for msg in consumer:
                 payload = orjson.loads(msg.value)
                 order_id = payload.get("order_id")
-                try:
-                    await deliver(client, payload)
-                    log.info("Delivered order_id=%s to external ERP", order_id)
-                    deliveries_total.labels(outcome="success").inc()
-                except (TransientDeliveryError, httpx.HTTPStatusError) as exc:
-                    # TransientDeliveryError here means @retry's 5 attempts were
-                    # exhausted (reraise=True re-raises the original exception,
-                    # not tenacity.RetryError — routing on RetryError was dead
-                    # code that let an exhausted delivery crash the process).
-                    # HTTPStatusError is a non-retryable 4xx from the ERP.
-                    log.error(
-                        "Failed to deliver order_id=%s (%s) — routing to DLQ", order_id, exc
-                    )
-                    await producer.send_and_wait(TOPIC_DLQ, value=msg.value, key=msg.key)
-                    deliveries_total.labels(outcome="dlq").inc()
+                # Continues the trace started at the webhook: the headers
+                # were written by ingestion-consumer when it published
+                # ORDER_APPROVED. Each httpx retry shows up as its own child span.
+                with tracer.start_as_current_span(
+                    f"{TOPIC_ORDER_APPROVED} process",
+                    context=extract_kafka_context(msg.headers),
+                    kind=trace.SpanKind.CONSUMER,
+                ) as span:
+                    span.set_attribute("messaging.system", "kafka")
+                    span.set_attribute("messaging.destination.name", TOPIC_ORDER_APPROVED)
+                    span.set_attribute("order.id", str(order_id))
+                    try:
+                        await deliver(client, payload)
+                        log.info("Delivered order_id=%s to external ERP", order_id)
+                        deliveries_total.labels(outcome="success").inc()
+                    except (TransientDeliveryError, httpx.HTTPStatusError) as exc:
+                        # TransientDeliveryError here means @retry's 5 attempts were
+                        # exhausted (reraise=True re-raises the original exception,
+                        # not tenacity.RetryError — routing on RetryError was dead
+                        # code that let an exhausted delivery crash the process).
+                        # HTTPStatusError is a non-retryable 4xx from the ERP.
+                        log.error(
+                            "Failed to deliver order_id=%s (%s) — routing to DLQ", order_id, exc
+                        )
+                        span.record_exception(exc)
+                        span.set_status(trace.Status(trace.StatusCode.ERROR, "routed to DLQ"))
+                        await producer.send_and_wait(
+                            TOPIC_DLQ, value=msg.value, key=msg.key, headers=inject_kafka_headers()
+                        )
+                        deliveries_total.labels(outcome="dlq").inc()
                 await consumer.commit()
         finally:
             await consumer.stop()

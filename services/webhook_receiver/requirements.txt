@@ -5,3 +5,7 @@ pydantic==2.9.2
 orjson==3.10.7
 cramjam==2.12.1
 prometheus-client==0.21.0
+opentelemetry-sdk==1.27.0
+opentelemetry-exporter-otlp-proto-grpc==1.27.0
+opentelemetry-instrumentation-logging==0.48b0
+opentelemetry-instrumentation-fastapi==0.48b0

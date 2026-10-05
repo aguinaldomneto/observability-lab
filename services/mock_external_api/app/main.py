@@ -9,9 +9,14 @@ import random
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
+from common.telemetry import setup_tracing
+
+setup_tracing("mock-external-api")
 app = FastAPI(title="mock-external-erp")
+FastAPIInstrumentor.instrument_app(app, excluded_urls="health,metrics")
 FAILURE_RATE = float(os.environ.get("FAILURE_RATE", "0.3"))
 
 received: list[dict[str, Any]] = []
