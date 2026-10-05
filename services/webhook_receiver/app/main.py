@@ -10,11 +10,16 @@ from typing import Any, Literal
 import orjson
 from aiokafka import AIOKafkaProducer
 from fastapi import FastAPI, HTTPException, Response
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 
+from common.telemetry import inject_kafka_headers, setup_tracing
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("webhook-receiver")
+tracer = setup_tracing("webhook-receiver")
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 TOPIC_WEBHOOK_EVENTS = os.environ.get("TOPIC_WEBHOOK_EVENTS", "webhook-events")
@@ -48,6 +53,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="webhook-receiver", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app, excluded_urls="health,metrics")
 
 EventType = Literal[
     "ORDER_CREATED", "ORDER_STATUS_CHANGED", "PAYMENT_CONFIRMED", "INVOICE_ISSUED"
@@ -96,15 +102,25 @@ async def receive_webhook(envelope: WebhookEnvelope) -> dict[str, str]:
         }
     )
 
-    try:
-        await producer.send_and_wait(
-            TOPIC_WEBHOOK_EVENTS,
-            key=partition_key.encode("utf-8"),
-            value=value,
-        )
-    except Exception:
-        log.exception("Failed to publish event %s to Kafka", envelope.event_id)
-        webhook_publish_failures_total.inc()
-        raise HTTPException(status_code=503, detail="event broker unavailable, retry later") from None
+    # PRODUCER span: its context rides in the Kafka headers, so the consumer's
+    # span becomes a child of this one even though they share no process.
+    with tracer.start_as_current_span(
+        f"{TOPIC_WEBHOOK_EVENTS} publish", kind=trace.SpanKind.PRODUCER
+    ) as span:
+        span.set_attribute("messaging.system", "kafka")
+        span.set_attribute("messaging.destination.name", TOPIC_WEBHOOK_EVENTS)
+        span.set_attribute("event.id", envelope.event_id)
+        span.set_attribute("event.type", envelope.event_type)
+        try:
+            await producer.send_and_wait(
+                TOPIC_WEBHOOK_EVENTS,
+                key=partition_key.encode("utf-8"),
+                value=value,
+                headers=inject_kafka_headers(),
+            )
+        except Exception:
+            log.exception("Failed to publish event %s to Kafka", envelope.event_id)
+            webhook_publish_failures_total.inc()
+            raise HTTPException(status_code=503, detail="event broker unavailable, retry later") from None
     webhooks_received_total.labels(event_type=envelope.event_type).inc()
     return {"status": "accepted", "event_id": envelope.event_id}

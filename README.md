@@ -289,6 +289,44 @@ TELEGRAM_CHAT_ID=...
 
 Sem essas variáveis, o envio é só pulado (com um aviso no log do Airflow) — nunca derruba a DAG por causa disso. É a forma de saber que uma carga de 10M terminou sem precisar ficar com o Airflow aberto esperando.
 
+## Rastreamento distribuído (OpenTelemetry)
+
+Além das métricas (Prometheus), os 4 serviços Python emitem **traces** via OpenTelemetry. Um único webhook gera um trace só, atravessando os processos e o Kafka:
+
+```
+POST /webhooks/events (webhook-receiver)
+ └─ webhook-events publish          [PRODUCER]
+     └─ webhook-events process      [CONSUMER, ingestion-consumer]
+         ├─ spans SQL (SQLAlchemy)
+         └─ (se APPROVED) publica em order-approved
+             └─ order-approved process   [CONSUMER, order-approved-worker]
+                 └─ POST /erp/orders (httpx, um span por retry) → mock-external-api
+```
+
+Como funciona:
+
+- `common/telemetry.py` configura o SDK e exporta por OTLP/gRPC pro `otel-collector`. Sem `OTEL_EXPORTER_OTLP_ENDPOINT` o tracing vira no-op e o serviço roda normal.
+- **O Kafka não tem auto-instrumentação aqui, de propósito.** O contexto (`traceparent`) vai nos headers da mensagem (`inject_kafka_headers` / `extract_kafka_context`). É isso que costura produtor e consumidor num trace só, mesmo sem compartilhar processo.
+- O `otel-collector` (`monitoring/otel/collector.yml`) é o único destino que as aplicações conhecem. Trocar ou adicionar backend é editar esse arquivo, sem mexer em código.
+- Backend atual: **Grafana Tempo**. No Grafana (`http://localhost:3000`) → *Explore* → datasource **Tempo** → *Search*, filtrando por `service.name`.
+- Os logs ganham `otelTraceID`/`otelSpanID` (via `LoggingInstrumentor`), mas o formato de log atual não os imprime. Pra correlacionar, adicione `%(otelTraceID)s` ao `format` do `logging.basicConfig`.
+
+Pra ver um trace com retry: suba o ambiente, rode o `load-simulator` (com `FAILURE_RATE=0.3` o mock falha seguido) e procure um trace do `order-approved-worker` com vários spans `POST` filhos.
+
+### Zabbix 8.0: estado real
+
+Ainda **não está integrado**, e não por falta de vontade:
+
+- O 8.0 está em **release candidate** (`8.0.0rc1`, out/2026). Não tem tag `8.0` estável no Docker Hub.
+- O receptor OTLP/gRPC (porta 4317) existe **só no Zabbix proxy** e depende de compilar com `--with-apm`. Pelo que a comunidade reportou, as imagens oficiais `alpine-trunk` foram compiladas sem isso e rejeitam `APMListenIP`/`APMListenPort`. Ou seja, hoje precisaria de um build próprio do proxy.
+- Os dados de APM ficam em **ClickHouse**, que, segundo a documentação, não é suportado no proxy.
+
+Como a aplicação só fala com o Collector, plugar o Zabbix depois é só um exporter `otlp` novo apontando pro proxy no `collector.yml`, sem refazer instrumentação. **Isso não foi testado.**
+
+### O que não foi validado
+
+O ambiente onde isto foi escrito não tinha daemon Docker. Foi verificado: `ruff`, `docker compose config`, imports dos serviços com as dependências pinadas e um teste da propagação de contexto pelos headers. **Não foi verificado**: o `docker compose up` completo, o Collector entregando ao Tempo, e os traces aparecendo no Grafana. Rode e abra uma issue se algo quebrar.
+
 ## Modelagem: o que cada tabela resolve
 
 - **Chaves substitutas são `BIGINT IDENTITY`, não GUID.** O índice clusterizado do SQL Server é a ordem física das linhas na tabela; inserts com GUID aleatório fragmentam esse índice sob concorrência. Cada entidade externa mantém sua própria chave natural (`external_order_id`, `external_payment_id`, ...) como coluna `UNIQUE`, que serve também de chave de idempotência.

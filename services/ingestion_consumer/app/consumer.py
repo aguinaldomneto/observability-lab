@@ -13,15 +13,19 @@ from typing import Any
 import db_ops
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord
+from opentelemetry import trace
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from prometheus_client import Counter, start_http_server
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from common.db import get_engine
+from common.telemetry import extract_kafka_context, inject_kafka_headers, setup_tracing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ingestion-consumer")
+tracer = setup_tracing("ingestion-consumer")
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 events_processed_total = Counter(
@@ -45,6 +49,7 @@ BATCH_MAX_RECORDS = int(os.environ.get("BATCH_MAX_RECORDS", "200"))
 BATCH_TIMEOUT_MS = int(os.environ.get("BATCH_TIMEOUT_MS", "500"))
 
 engine = get_engine(pool_size=10, max_overflow=10)
+SQLAlchemyInstrumentor().instrument(engine=engine)
 
 
 def process_event(conn: Connection, event: dict[str, Any]) -> dict[str, Any] | None:
@@ -103,6 +108,22 @@ def process_event(conn: Connection, event: dict[str, Any]) -> dict[str, Any] | N
 
 
 async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> None:
+    # CONSUMER span parented on the webhook-receiver's PRODUCER span via the
+    # Kafka headers. SQL statements (SQLAlchemy) and the ORDER_APPROVED
+    # publish below nest under it.
+    with tracer.start_as_current_span(
+        f"{TOPIC_WEBHOOK_EVENTS} process",
+        context=extract_kafka_context(msg.headers),
+        kind=trace.SpanKind.CONSUMER,
+    ) as span:
+        span.set_attribute("messaging.system", "kafka")
+        span.set_attribute("messaging.destination.name", TOPIC_WEBHOOK_EVENTS)
+        span.set_attribute("messaging.kafka.partition", msg.partition)
+        span.set_attribute("messaging.kafka.offset", msg.offset)
+        await _handle_message(msg, producer)
+
+
+async def _handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> None:
     try:
         event = orjson.loads(msg.value)
         event_id = event["event_id"]
@@ -176,6 +197,7 @@ async def handle_message(msg: ConsumerRecord, producer: AIOKafkaProducer) -> Non
                 TOPIC_ORDER_APPROVED,
                 key=str(outbox["order"]["order_id"]).encode(),
                 value=orjson.dumps(outbox["order"], default=_json_default),
+                headers=inject_kafka_headers(),
             )
             log.info("Published ORDER_APPROVED for order_id=%s", outbox["order"]["order_id"])
         except Exception as exc:
